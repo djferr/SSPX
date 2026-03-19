@@ -1535,16 +1535,15 @@ def render_feed_pick_card(row: dict, price_data: Dict[str, pd.DataFrame], rank_n
     symbol = str(row.get("symbol", ""))
     spark_uri = make_sparkline_data_uri(price_data.get(symbol))
     badges = get_pick_badges(row)
-    badges.append(badge_html("Pro Selection", "purple") if hero else badge_html(f"Rank #{rank_number}", "purple"))
+    badges.append(badge_html("Top Pick", "purple") if hero else badge_html(f"Pick #{rank_number}", "purple"))
 
     spark_html = (
-        f'<img src="{spark_uri}" style="width:100%;height:68px;display:block;" />'
+        f'<img src="{spark_uri}" style="width:100%;height:{84 if hero else 76}px;display:block;" />'
         if spark_uri
         else '<div style="color:#9ca3af;font-size:0.85rem;">No sparkline</div>'
     )
 
-    title = "Top Pick of the Day" if hero else f"Top Pick #{rank_number}"
-    subtitle = "Swipe-style feed card • tap below for full setup" if hero else "Ranked opportunity • tap below for full setup"
+    title = "Top Pick of the Day" if hero else f"Pick #{rank_number}"
 
     st.markdown(
         f"""
@@ -1553,30 +1552,18 @@ def render_feed_pick_card(row: dict, price_data: Dict[str, pd.DataFrame], rank_n
             border: 1px solid rgba(255,255,255,0.10);
             border-radius: {'24px' if hero else '20px'};
             padding: {'24px' if hero else '18px'};
-            margin-bottom: 14px;
+            margin-bottom: 12px;
             box-shadow: 0 14px 34px rgba(0,0,0,0.20);
         ">
             <div style="font-size:0.86rem;color:#93c5fd;font-weight:700;margin-bottom:8px;">{title}</div>
             <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:18px;flex-wrap:wrap;">
                 <div style="flex:1;min-width:260px;">
-                    <div style="font-size:{'2rem' if hero else '1.45rem'};font-weight:900;color:#f8fafc;margin-bottom:10px;">
+                    <div style="font-size:{'2.15rem' if hero else '1.55rem'};font-weight:900;color:#f8fafc;margin-bottom:12px;letter-spacing:-0.02em;">
                         {symbol}
                     </div>
-                    <div style="margin-bottom:12px;">{''.join(badges)}</div>
-                    <div style="display:grid;grid-template-columns:repeat(2,minmax(120px,1fr));gap:8px 18px;color:#d1d5db;font-size:0.96rem;line-height:1.6;">
-                        <div><b>Score:</b> {row.get('score')}</div>
-                        <div><b>Confidence:</b> {row.get('confidence_label')} ({row.get('confidence_score')})</div>
-                        <div><b>Setup:</b> {row.get('setup_type')}</div>
-                        <div><b>Close:</b> {row.get('close')}</div>
-                        <div><b>Target:</b> {row.get('target')}</div>
-                        <div><b>3M RS:</b> {row.get('rs_vs_benchmark_3m')}%</div>
-                        <div><b>Sector:</b> {row.get('sector')}</div>
-                        <div style="grid-column:1 / -1;"><b>Catalysts:</b> {row.get('catalyst_tags') or 'None'}</div>
-                        <div style="grid-column:1 / -1;"><b>Why this pick:</b> {render_why_pick_inline(row.get('why_pick', ''), row.get('explanation', ''))}</div>
-                    </div>
+                    <div style="margin-bottom:14px;">{''.join(badges)}</div>
                 </div>
-                <div style="min-width:220px;flex:0 0 220px;">
-                    <div style="font-size:0.8rem;color:#9ca3af;margin-bottom:8px;">{subtitle}</div>
+                <div style="min-width:240px;flex:0 0 240px;">
                     <div style="
                         background:#0b1220;
                         border:1px solid rgba(255,255,255,0.08);
@@ -1592,9 +1579,39 @@ def render_feed_pick_card(row: dict, price_data: Dict[str, pd.DataFrame], rank_n
         unsafe_allow_html=True,
     )
 
-    expander_label = "Open full setup details" if hero else f"Open #{rank_number} full setup"
-    with st.expander(expander_label, expanded=hero):
-        render_pick_detail_panel(row, price_data, "Top Pick" if hero else f"Pick #{rank_number}")
+    quick_label = "Tap for quick view" if hero else f"Tap for Pick #{rank_number} quick view"
+    detail_key = f"show_breakdown_{symbol}_{rank_number}_{'hero' if hero else 'feed'}"
+    with st.expander(quick_label, expanded=hero):
+        st.markdown(
+            f"""
+            <div style="
+                background: linear-gradient(180deg, #111827 0%, #0f172a 100%);
+                border: 1px solid rgba(255,255,255,0.08);
+                border-radius: 18px;
+                padding: 18px;
+                margin-bottom: 12px;
+                box-shadow: 0 10px 28px rgba(0,0,0,0.16);
+            ">
+                <div style="display:grid;grid-template-columns:repeat(2,minmax(120px,1fr));gap:10px 18px;color:#d1d5db;font-size:0.96rem;line-height:1.6;">
+                    <div><b>Score:</b> {row.get('score')}</div>
+                    <div><b>Setup:</b> {row.get('setup_type')}</div>
+                    <div><b>Confidence:</b> {row.get('confidence_label')}</div>
+                    <div><b>Target:</b> {row.get('target')}</div>
+                    <div><b>Close:</b> {row.get('close')}</div>
+                    <div><b>3M RS:</b> {row.get('rs_vs_benchmark_3m')}%</div>
+                    <div style="grid-column:1 / -1;"><b>Tags:</b> {row.get('catalyst_tags') or 'None'}</div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        btn_label = "Show full breakdown" if hero else f"Show Pick #{rank_number} full breakdown"
+        detail_state_key = f"{detail_key}_open"
+        button_key = f"{detail_key}_button"
+        if st.button(btn_label, key=button_key, use_container_width=True):
+            st.session_state[detail_state_key] = not st.session_state.get(detail_state_key, False)
+        if st.session_state.get(detail_state_key, False):
+            render_pick_detail_panel(row, price_data, "Top Pick" if hero else f"Pick #{rank_number}")
 
 
 def render_top_pick_hero(results_df: pd.DataFrame, price_data: Dict[str, pd.DataFrame]):
@@ -1619,7 +1636,7 @@ def render_ranked_feed(results_df: pd.DataFrame, price_data: Dict[str, pd.DataFr
     if results_df.empty:
         return
 
-    st.markdown("#### Ranked Feed")
+    st.markdown("#### Ranked Picks")
 
     ranked = results_df.sort_values(
         by=["score", "technical_score", "rs_vs_benchmark_3m", "volume_ratio_today"],
@@ -1928,8 +1945,8 @@ def scanner_tab(account_size, risk_percent, top_n, only_a_plus, only_breakout, o
                 <div style="font-size:0.95rem;color:#d1d5db;line-height:1.7;">
                     Tap <span style="color:#93c5fd;font-weight:700;">Scan Now</span>, review the
                     <span style="color:#93c5fd;font-weight:700;">Top Pick of the Day</span>, then
-                    scroll a ranked feed of the next best setups. Each card opens into a fuller
-                    setup view with chart, trade plan, and save actions.
+                    review the Top Pick of the Day first, then scroll through the ranked picks.
+                    Each pick gives a quick view first, with a full breakdown available after that.
                     <br><br>
                     Current benchmark mode:
                     <span style="color:#93c5fd;font-weight:700;">{selected_benchmark}</span>
