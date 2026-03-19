@@ -5,3 +5,4 @@ yfinance
 plotly
 streamlit-aggrid
 python-dateutil
+matplotlib
