@@ -1,0 +1,2 @@
+date,symbol,entry,stop,target,shares,setup_type,score,notes,status
+2026-03-17,FE,52.01,50.08,58.25,51,Breakout Setup,115,"short_term_trend, above_50ma, 50_over_150, 150_over_200, above_200ma, within_5pct_of_high, well_above_52w_low, strong_rs_3m, good_rs_6m, tight_10d, near_pivot, very_liquid, controlled_volatility, trend_strength",planned
