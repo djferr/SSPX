@@ -5,7 +5,7 @@ import json
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import quote
 
@@ -51,8 +51,6 @@ class ScanResult:
     symbol: str
     close: float
     score: int
-    technical_score: int
-    news_score: int
     setup_type: str
     breakout_ready: bool
     market_ok: bool
@@ -69,16 +67,9 @@ class ScanResult:
     earnings_warning: str
     entry: float
     stop: float
+    target: float
     risk_per_share: float
     position_size_shares: int
-    news_sentiment: str
-    news_headline: str
-    news_count: int
-    news_link: str
-    catalyst_tags: str
-    confidence_score: int
-    confidence_label: str
-    why_pick: str
     explanation: str
     notes: str
 
@@ -196,253 +187,6 @@ class MetaHelper:
             pass
 
         return sector, earnings_warning
-
-
-
-class NewsEngine:
-    POSITIVE_KEYWORDS = [
-        "beats", "beat", "raised guidance", "guidance raise", "guidance raised",
-        "upgrade", "upgraded", "buyback", "repurchase", "contract", "contracts",
-        "approval", "approved", "partnership", "partner", "record", "strong",
-        "growth", "surge", "expands", "expansion", "acquisition", "launch",
-        "profit jumps", "sales jump", "wins", "award", "dividend increase",
-    ]
-    NEGATIVE_KEYWORDS = [
-        "miss", "misses", "missed", "cuts guidance", "guidance cut", "downgrade",
-        "downgraded", "offering", "secondary", "lawsuit", "probe", "investigation",
-        "delay", "delayed", "recall", "weak", "slump", "decline", "fall",
-        "falls", "fraud", "bankruptcy", "layoffs", "layoff", "warning",
-    ]
-    TAG_RULES = {
-        "EARNINGS BEAT": ["beats", "beat earnings", "tops estimates", "strong quarter"],
-        "ANALYST UPGRADE": ["upgrade", "upgraded", "raises target", "price target raised"],
-        "GUIDANCE RAISED": ["raised guidance", "guidance raised", "raises outlook", "boosts forecast"],
-        "PARTNERSHIP": ["partnership", "partner", "collaboration", "strategic alliance"],
-        "CONTRACT WIN": ["contract", "contracts", "award", "wins", "order", "deal"],
-        "PRODUCT / AI": ["launch", "product", " ai ", "chip", "platform", "rollout"],
-        "BUYBACK / CAPITAL RETURN": ["buyback", "repurchase", "dividend increase", "capital return"],
-        "FDA / REGULATORY": ["approval", "approved", "fda", "regulatory", "clearance"],
-        "M&A": ["acquisition", "acquire", "merger", "takeover"],
-        "OFFERING RISK": ["offering", "secondary", "dilution"],
-        "LEGAL / PROBE": ["lawsuit", "probe", "investigation", "fraud", "subpoena"],
-        "GUIDANCE CUT": ["cuts guidance", "guidance cut", "lowers outlook", "withdraws guidance"],
-    }
-
-    @staticmethod
-    def _extract_tags(text_blob: str) -> List[str]:
-        tags = []
-        blob = f" {text_blob.lower()} "
-        for tag, keywords in NewsEngine.TAG_RULES.items():
-            if any(kw in blob for kw in keywords):
-                tags.append(tag)
-        return tags[:3]
-
-    @staticmethod
-    def _confidence_label(score: int) -> str:
-        if score >= 85:
-            return "High"
-        if score >= 70:
-            return "Medium"
-        return "Watch"
-
-    @staticmethod
-    def _parse_news_item(item: dict) -> dict:
-        title = ""
-        summary = ""
-        link = ""
-        publisher = ""
-        published = None
-
-        if not isinstance(item, dict):
-            return {"title": title, "summary": summary, "link": link, "publisher": publisher, "published": published}
-
-        content = item.get("content")
-        if isinstance(content, dict):
-            title = str(content.get("title") or item.get("title") or "").strip()
-            summary = str(
-                content.get("summary")
-                or content.get("description")
-                or item.get("summary")
-                or item.get("description")
-                or ""
-            ).strip()
-            link = str(
-                content.get("canonicalUrl", {}).get("url")
-                or content.get("clickThroughUrl", {}).get("url")
-                or item.get("link")
-                or ""
-            ).strip()
-            publisher = str(content.get("provider", {}).get("displayName") or item.get("publisher") or "").strip()
-            published_raw = content.get("pubDate") or item.get("providerPublishTime")
-        else:
-            title = str(item.get("title") or "").strip()
-            summary = str(item.get("summary") or item.get("description") or "").strip()
-            link = str(item.get("link") or item.get("url") or "").strip()
-            publisher = str(item.get("publisher") or "").strip()
-            published_raw = item.get("providerPublishTime") or item.get("pubDate")
-
-        if published_raw:
-            try:
-                if isinstance(published_raw, (int, float)):
-                    published = datetime.fromtimestamp(float(published_raw), tz=timezone.utc)
-                else:
-                    ts = pd.to_datetime(published_raw, utc=True)
-                    if pd.notna(ts):
-                        published = ts.to_pydatetime()
-                    else:
-                        published = None
-            except Exception:
-                published = None
-
-        return {"title": title, "summary": summary, "link": link, "publisher": publisher, "published": published}
-
-    @staticmethod
-    @st.cache_data(show_spinner=False, ttl=900)
-    def get_recent_news(symbol: str) -> List[dict]:
-        try:
-            raw_items = yf.Ticker(symbol).news or []
-        except Exception:
-            raw_items = []
-
-        cleaned = []
-        for item in raw_items[:12]:
-            parsed = NewsEngine._parse_news_item(item)
-            if parsed["title"]:
-                cleaned.append(parsed)
-        return cleaned
-
-    @staticmethod
-    def score_news(symbol: str, row: pd.Series, price_df: Optional[pd.DataFrame]) -> dict:
-        articles = NewsEngine.get_recent_news(symbol)
-        technical_score = int(row.get("technical_score", row.get("score", 0)))
-        if not articles:
-            confidence_score = max(0, min(100, technical_score))
-            return {
-                "news_score": 0,
-                "news_sentiment": "No news",
-                "news_headline": "No recent headline found",
-                "news_count": 0,
-                "news_link": "",
-                "news_note": "",
-                "catalyst_tags": [],
-                "freshness_label": "No fresh catalyst",
-                "freshness_hours": None,
-                "confidence_score": confidence_score,
-                "confidence_label": NewsEngine._confidence_label(confidence_score),
-                "why_pick": [
-                    f"Technical score is {technical_score}",
-                    f"Setup is {row.get('setup_type', 'Unknown')}",
-                    "No recent headline found to confirm or weaken the setup",
-                ],
-            }
-
-        now = datetime.now(timezone.utc)
-        fresh_articles = []
-        positive_hits = 0
-        negative_hits = 0
-        catalyst_hits = 0
-        tag_counts: Dict[str, int] = {}
-        freshest_hours = None
-
-        for article in articles:
-            title = article.get("title", "")
-            summary = article.get("summary", "")
-            text_blob = f"{title} {summary}".lower()
-
-            published = article.get("published")
-            if isinstance(published, datetime):
-                age_hours = (now - published).total_seconds() / 3600
-                if freshest_hours is None or age_hours < freshest_hours:
-                    freshest_hours = age_hours
-                if published >= now - timedelta(days=3):
-                    fresh_articles.append(article)
-
-            positive_hits += sum(1 for kw in NewsEngine.POSITIVE_KEYWORDS if kw in text_blob)
-            negative_hits += sum(1 for kw in NewsEngine.NEGATIVE_KEYWORDS if kw in text_blob)
-            catalyst_hits += sum(1 for kw in ["beats", "raised guidance", "upgrade", "buyback", "contract", "approval", "partnership", "record", "acquisition", "launch", "wins"] if kw in text_blob)
-            for tag in NewsEngine._extract_tags(text_blob):
-                tag_counts[tag] = tag_counts.get(tag, 0) + 1
-
-        score = 0
-        note_parts = []
-
-        if len(fresh_articles) >= 2:
-            score += 5
-            note_parts.append("multiple fresh headlines")
-        elif len(fresh_articles) == 1:
-            score += 2
-            note_parts.append("fresh headline")
-
-        if positive_hits > negative_hits and positive_hits > 0:
-            score += 5
-            note_parts.append("positive news tone")
-        elif negative_hits > positive_hits and negative_hits > 0:
-            score -= 7
-            note_parts.append("negative news tone")
-
-        if catalyst_hits > 0:
-            score += 4
-            note_parts.append("clear catalyst")
-
-        if price_df is not None and not price_df.empty and len(price_df) >= 21:
-            close = float(price_df["Close"].iloc[-1])
-            ma21 = float(price_df["Close"].rolling(21).mean().iloc[-1])
-            avg_vol = float(price_df["Volume"].rolling(20).mean().iloc[-1])
-            today_vol = float(price_df["Volume"].iloc[-1])
-            if close > ma21 and avg_vol > 0 and today_vol / avg_vol >= 1.1:
-                score += 3
-                note_parts.append("price/volume confirms")
-
-        score = int(max(-10, min(20, score)))
-
-        if score >= 8:
-            sentiment = "Bullish"
-        elif score <= -4:
-            sentiment = "Risk"
-        else:
-            sentiment = "Neutral"
-
-        best_article = fresh_articles[0] if fresh_articles else articles[0]
-        note = " + ".join(note_parts) if note_parts else "headline context only"
-        catalyst_tags = [tag for tag, _ in sorted(tag_counts.items(), key=lambda x: (-x[1], x[0]))[:3]]
-
-        volume_ratio = float(row.get("volume_ratio_today", 0) or 0)
-        volume_conf = 10 if volume_ratio >= 1.5 else 6 if volume_ratio >= 1.1 else 2
-        news_alignment = max(0, min(20, score + 10))
-        confidence_score = int(max(0, min(100, technical_score + news_alignment // 2 + volume_conf)))
-        confidence_label = NewsEngine._confidence_label(confidence_score)
-
-        if freshest_hours is None:
-            freshness_label = "No timestamp"
-        elif freshest_hours < 24:
-            freshness_label = f"Fresh catalyst · {int(freshest_hours)}h ago"
-        else:
-            freshness_label = f"Fresh catalyst · {int(freshest_hours // 24)}d ago"
-
-        why_pick = [
-            f"Technical score is {technical_score} with a {row.get('setup_type', 'Unknown')} setup",
-            f"Relative strength is {row.get('rs_vs_benchmark_3m', 0)}% vs benchmark over 3 months",
-            f"Volume is running at {row.get('volume_ratio_today', 0)}x normal",
-        ]
-        if catalyst_tags:
-            why_pick.append(f"Catalyst tags: {', '.join(catalyst_tags)}")
-        why_pick.append(f"News tone is {sentiment.lower()} with score impact {score}")
-
-        return {
-            "news_score": score,
-            "news_sentiment": sentiment,
-            "news_headline": best_article.get("title", "No recent headline found"),
-            "news_count": len(articles),
-            "news_link": best_article.get("link", ""),
-            "news_note": note,
-            "catalyst_tags": catalyst_tags,
-            "freshness_label": freshness_label,
-            "freshness_hours": freshest_hours,
-            "confidence_score": confidence_score,
-            "confidence_label": confidence_label,
-            "why_pick": why_pick,
-        }
-
 
 
 class ScannerEngine:
@@ -615,7 +359,7 @@ class ScannerEngine:
         atr_pct: float,
         account_size: float,
         risk_percent: float,
-    ) -> Tuple[float, float, float, int]:
+    ) -> Tuple[float, float, float, float, int]:
         entry = round(max(close, pivot), 2)
         stop_candidate_1 = pivot * 0.97
         stop_candidate_2 = ma21 * 0.99
@@ -626,9 +370,10 @@ class ScannerEngine:
             stop = round(min(stop, atr_stop), 2)
 
         risk_per_share = round(max(0.01, entry - stop), 2)
+        target = round(entry + (risk_per_share * 2.0), 2)
         max_risk_dollars = max(1.0, account_size * (risk_percent / 100.0))
         shares = int(max_risk_dollars // risk_per_share) if risk_per_share > 0 else 0
-        return entry, stop, risk_per_share, max(0, shares)
+        return entry, stop, target, risk_per_share, max(0, shares)
 
     @staticmethod
     def build_explanation(
@@ -640,18 +385,13 @@ class ScannerEngine:
         cautions: List[str],
         entry: float,
         stop: float,
+        target: float,
         shares: int,
-        news_score: int = 0,
-        news_sentiment: str = "Neutral",
-        news_headline: str = "",
     ) -> str:
         lines = [f"Why {symbol} is a candidate:"]
         lines.append(f"- Setup type: {setup_type}")
         lines.append(f"- Scanner score: {score}")
         lines.append(f"- Market health filter: {'Healthy' if market_ok else 'Not ideal'}")
-        lines.append(f"- News confirmation score: {news_score} ({news_sentiment})")
-        if news_headline:
-            lines.append(f"- Latest catalyst headline: {news_headline}")
 
         for reason in reasons:
             lines.append(f"- {reason}")
@@ -666,6 +406,7 @@ class ScannerEngine:
         lines.append("Trade planning ideas:")
         lines.append(f"- Suggested entry area: {entry:.2f}")
         lines.append(f"- Suggested stop area: {stop:.2f}")
+        lines.append(f"- Suggested first target / sell zone: {target:.2f}")
         lines.append(f"- Approx position size: {shares} shares")
         lines.append("- Wait for clean price behavior near the pivot instead of forcing a trade.")
         lines.append("- Use this as a shortlist tool, not an automatic buy signal.")
@@ -837,7 +578,7 @@ class ScannerEngine:
         if "Earnings in" in earnings_warning:
             cautions.append("Earnings are coming soon, which adds event risk.")
 
-        entry, stop, risk_per_share, shares = ScannerEngine.build_trade_plan(
+        entry, stop, target, risk_per_share, shares = ScannerEngine.build_trade_plan(
             close=close,
             pivot=pivot,
             ma21=ma21,
@@ -845,8 +586,6 @@ class ScannerEngine:
             account_size=account_size,
             risk_percent=risk_percent,
         )
-
-        technical_score = score
 
         explanation = ScannerEngine.build_explanation(
             symbol=symbol,
@@ -857,18 +596,14 @@ class ScannerEngine:
             cautions=cautions,
             entry=entry,
             stop=stop,
+            target=target,
             shares=shares,
-            news_score=0,
-            news_sentiment="Neutral",
-            news_headline="",
         )
 
         return ScanResult(
             symbol=symbol,
             close=round(close, 2),
             score=int(score),
-            technical_score=int(technical_score),
-            news_score=0,
             setup_type=setup_type,
             breakout_ready=breakout_ready,
             market_ok=market_ok,
@@ -885,16 +620,9 @@ class ScannerEngine:
             earnings_warning=earnings_warning,
             entry=entry,
             stop=stop,
+            target=target,
             risk_per_share=risk_per_share,
             position_size_shares=shares,
-            news_sentiment="Neutral",
-            news_headline="No recent headline found",
-            news_count=0,
-            news_link="",
-            catalyst_tags="",
-            confidence_score=int(max(0, min(100, technical_score + (8 if market_ok else 0)))),
-            confidence_label=NewsEngine._confidence_label(int(max(0, min(100, technical_score + (8 if market_ok else 0))))),
-            why_pick="Technical score leads | Waiting for catalyst confirmation",
             explanation=explanation,
             notes=", ".join(notes),
         )
@@ -1037,6 +765,48 @@ def inject_dark_theme():
             background: #111827;
             border-radius: 12px 12px 0 0;
             padding: 12px 18px;
+        }
+
+        .streamlit-expanderHeader {
+            background: linear-gradient(180deg, #111827 0%, #0f172a 100%) !important;
+            color: #f9fafb !important;
+            border: 1px solid rgba(255,255,255,0.08) !important;
+            border-radius: 16px !important;
+        }
+
+        [data-testid="stExpander"] {
+            background: linear-gradient(180deg, rgba(17,24,39,0.96) 0%, rgba(15,23,42,0.96) 100%) !important;
+            border: 1px solid rgba(255,255,255,0.08) !important;
+            border-radius: 18px !important;
+            overflow: hidden !important;
+            margin-bottom: 16px !important;
+        }
+
+        [data-testid="stExpander"] details,
+        [data-testid="stExpander"] details summary {
+            background: linear-gradient(180deg, #111827 0%, #0f172a 100%) !important;
+            color: #f9fafb !important;
+        }
+
+        [data-testid="stExpander"] details summary {
+            border-bottom: 1px solid rgba(255,255,255,0.08) !important;
+            padding: 0.75rem 1rem !important;
+        }
+
+        [data-testid="stExpander"] details summary:hover {
+            background: linear-gradient(180deg, #182130 0%, #111827 100%) !important;
+        }
+
+        [data-testid="stExpander"] svg,
+        [data-testid="stExpander"] summary svg {
+            fill: #e5e7eb !important;
+            color: #e5e7eb !important;
+        }
+
+        [data-testid="stExpanderDetails"] {
+            background: linear-gradient(180deg, rgba(17,24,39,0.96) 0%, rgba(15,23,42,0.96) 100%) !important;
+            color: #e5e7eb !important;
+            padding-top: 0.75rem !important;
         }
 
         [data-testid="stMetric"] {
@@ -1203,15 +973,6 @@ Example:
 
 Estimated position size = **50 shares**
 
-### News confirmation layer
-
-When enabled, the scanner can add a **small news confirmation bonus** on top of the technical score.
-It looks for:
-- fresh headlines
-- supportive / risky wording
-- clearer catalysts like beats, upgrades, contracts, approvals, or guidance changes
-- price / volume action that agrees with the story
-
 ### Bottom line
 
 This is a **ranking + planning tool**, not an automatic buy signal.
@@ -1237,11 +998,48 @@ def ensure_state() -> None:
         st.session_state.selected_benchmark = "Auto"
     if "min_score_filter" not in st.session_state:
         st.session_state.min_score_filter = 0
-    if "use_news_confirmation" not in st.session_state:
-        st.session_state.use_news_confirmation = True
-    if "strict_news_mode" not in st.session_state:
-        st.session_state.strict_news_mode = False
 
+
+
+
+def ensure_results_schema(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame() if df is None else df
+
+    out = df.copy()
+    defaults = {
+        "technical_score": out["score"] if "score" in out.columns else 0,
+        "news_score": 0,
+        "breakout_ready": False,
+        "rs_vs_benchmark_3m": 0.0,
+        "volume_ratio_today": 0.0,
+        "confidence_score": out["score"] if "score" in out.columns else 0,
+        "confidence_label": "Watch",
+        "sector": "Unknown",
+        "setup_type": "Mixed Setup",
+        "close": 0.0,
+        "entry": 0.0,
+        "stop": 0.0,
+        "target": 0.0,
+        "position_size_shares": 0,
+        "news_headline": "No recent headline found",
+        "catalyst_tags": "",
+        "why_pick": "",
+        "earnings_warning": "Unknown",
+        "market_ok": False,
+    }
+
+    for col, default in defaults.items():
+        if col not in out.columns:
+            out[col] = default
+
+    if "technical_score" in out.columns and "score" in out.columns:
+        out["technical_score"] = out["technical_score"].fillna(out["score"])
+    if "confidence_score" in out.columns and "score" in out.columns:
+        out["confidence_score"] = out["confidence_score"].fillna(out["score"])
+    if "confidence_label" in out.columns:
+        out["confidence_label"] = out["confidence_label"].replace("", np.nan).fillna("Watch")
+    return out
 
 def make_sparkline_data_uri(price_df: Optional[pd.DataFrame]) -> str:
     if price_df is None or price_df.empty or "Close" not in price_df.columns:
@@ -1288,8 +1086,6 @@ def run_scan_logic(
     account_size: float,
     risk_percent: float,
     selected_benchmark: str = "Auto",
-    use_news_confirmation: bool = True,
-    strict_news_mode: bool = False,
 ) -> Tuple[pd.DataFrame, Dict[str, pd.DataFrame], List[str], List[str]]:
     logs: List[str] = []
     alerts: List[str] = []
@@ -1351,11 +1147,8 @@ def run_scan_logic(
 
     out = pd.DataFrame([asdict(r) for r in results]) if results else pd.DataFrame()
     if not out.empty:
-        out["technical_score"] = out["technical_score"].fillna(out["score"]).astype(int)
-        out["news_score"] = out["news_score"].fillna(0).astype(int)
-
         out = out.sort_values(
-            by=["technical_score", "rs_vs_benchmark_3m", "pct_from_52w_high"],
+            by=["score", "rs_vs_benchmark_3m", "pct_from_52w_high"],
             ascending=[False, False, False],
         ).reset_index(drop=True)
 
@@ -1371,57 +1164,10 @@ def run_scan_logic(
                     current_expl += f"\n\nThings to watch:\n- {earnings_warning}, which adds event risk."
                     out.loc[out["symbol"] == sym, "explanation"] = current_expl
 
-        if use_news_confirmation and top_symbols:
-            logs.append(f"Applying news confirmation to top {len(top_symbols)} names...")
-            for sym in top_symbols:
-                news_meta = NewsEngine.score_news(sym, out.loc[out["symbol"] == sym].iloc[0], price_data.get(sym))
-                technical_score = int(out.loc[out["symbol"] == sym, "technical_score"].iloc[0])
-                final_score = int(max(0, min(100, technical_score + int(news_meta["news_score"]))))
-                out.loc[out["symbol"] == sym, "news_score"] = int(news_meta["news_score"])
-                out.loc[out["symbol"] == sym, "score"] = final_score
-                out.loc[out["symbol"] == sym, "news_sentiment"] = news_meta["news_sentiment"]
-                out.loc[out["symbol"] == sym, "news_headline"] = news_meta["news_headline"]
-                out.loc[out["symbol"] == sym, "news_count"] = int(news_meta["news_count"])
-                out.loc[out["symbol"] == sym, "news_link"] = news_meta["news_link"]
-                out.loc[out["symbol"] == sym, "catalyst_tags"] = ", ".join(news_meta.get("catalyst_tags", []))
-                out.loc[out["symbol"] == sym, "confidence_score"] = int(news_meta.get("confidence_score", technical_score))
-                out.loc[out["symbol"] == sym, "confidence_label"] = news_meta.get("confidence_label", "Watch")
-                out.loc[out["symbol"] == sym, "why_pick"] = " | ".join(news_meta.get("why_pick", []))
-
-                current_expl = str(out.loc[out["symbol"] == sym, "explanation"].iloc[0]).strip()
-                news_lines = [
-                    "",
-                    "News confirmation layer:",
-                    f"- News score impact: {int(news_meta['news_score'])}",
-                    f"- News sentiment: {news_meta['news_sentiment']}",
-                    f"- Freshness: {news_meta.get('freshness_label', 'No fresh catalyst')}",
-                    f"- Headline: {news_meta['news_headline']}",
-                ]
-                if news_meta.get("catalyst_tags"):
-                    news_lines.append(f"- Catalyst tags: {', '.join(news_meta['catalyst_tags'])}")
-                if news_meta.get("why_pick"):
-                    news_lines.append("- Why this pick:")
-                    news_lines.extend([f"  • {item}" for item in news_meta["why_pick"][:4]])
-                out.loc[out["symbol"] == sym, "explanation"] = current_expl + "\n" + "\n".join(news_lines)
-
-            if strict_news_mode:
-                out = out[(out["news_score"] >= 0) | (out["news_sentiment"] == "No news")].copy()
-
-        out = out.sort_values(
-            by=["score", "technical_score", "rs_vs_benchmark_3m", "pct_from_52w_high"],
-            ascending=[False, False, False, False],
-        ).reset_index(drop=True)
-
         alert_set = set()
         for _, row in out.head(20).iterrows():
             if row.get("breakout_ready", False):
                 alert_set.add(f"{row['symbol']}: near pivot / breakout-ready")
-            if int(row.get("news_score", 0)) >= 8:
-                alert_set.add(f"{row['symbol']}: bullish news confirmation")
-            if int(row.get("news_score", 0)) <= -4:
-                alert_set.add(f"{row['symbol']}: headline risk flagged")
-            if int(row.get("confidence_score", 0)) >= 85:
-                alert_set.add(f"{row['symbol']}: high-confidence setup")
             if row.get("volume_ratio_today", 0) >= 1.5:
                 alert_set.add(f"{row['symbol']}: volume surge ({row['volume_ratio_today']}x)")
             if "Earnings in" in str(row.get("earnings_warning", "")):
@@ -1577,7 +1323,282 @@ def render_scan_kpis(results_df: pd.DataFrame):
         st.markdown(info_tile("A+ setups", str(a_plus_count), f"Score {A_PLUS_SCORE}+"), unsafe_allow_html=True)
 
 
+
+def get_pick_badges(row: dict) -> List[str]:
+    badges = []
+    if int(row.get("score", 0)) >= A_PLUS_SCORE:
+        badges.append(badge_html("🟢 A+ setup", "green"))
+    if bool(row.get("breakout_ready", False)):
+        badges.append(badge_html("🔥 Breakout ready", "red"))
+    if int(row.get("news_score", 0)) >= 8:
+        badges.append(badge_html("📰 News confirmed", "green"))
+    elif int(row.get("news_score", 0)) <= -4:
+        badges.append(badge_html("📰 Headline risk", "yellow"))
+    if str(row.get("confidence_label", "")) == "High":
+        badges.append(badge_html("🎯 High confidence", "green"))
+    elif str(row.get("confidence_label", "")) == "Medium":
+        badges.append(badge_html("🎯 Medium confidence", "blue"))
+    if "Earnings in" in str(row.get("earnings_warning", "")):
+        badges.append(badge_html(f"⚠️ {row['earnings_warning']}", "yellow"))
+    return badges
+
+
+def build_clean_why_pick_items(why_pick: str, explanation: str = "") -> List[str]:
+    raw = str(why_pick or "").strip()
+    items: List[str] = []
+
+    if raw:
+        parts = [part.strip(" •-") for part in raw.split("|") if part.strip()]
+        for part in parts:
+            clean = str(part).strip()
+            if clean and clean.lower() != "no explanation available yet":
+                items.append(clean)
+
+    if not items:
+        exp = str(explanation or "")
+        extracted: List[str] = []
+        mapping = [
+            ("benchmark trend is healthy", "Supportive market backdrop"),
+            ("above the 10-day and 21-day", "Above 10/21-day moving averages"),
+            ("above the 50-day average", "Above 50-day moving average"),
+            ("above the 200-day average", "Above 200-day moving average"),
+            ("very close to its 52-week high", "Trading near 52-week highs"),
+            ("reasonably close to its 52-week high", "Trading near 52-week highs"),
+            ("strongly outperformed the market over the last 3 months", "Strong 3-month relative strength"),
+            ("outperformed the market over the last 3 months", "Strong 3-month relative strength"),
+            ("outperformed over 6 months", "Strong 6-month relative strength"),
+            ("price has tightened over the last 10 days", "Tight recent price action"),
+            ("close to its pivot area", "Near breakout / pivot zone"),
+            ("volume is clearly above normal today", "Volume confirming the move"),
+            ("volume is above normal today", "Volume above normal"),
+            ("liquidity is strong", "Strong liquidity"),
+        ]
+
+        for line in exp.splitlines():
+            s = line.strip()
+            if not s.startswith("-"):
+                continue
+            content = s.lstrip("-").strip()
+            lower = content.lower()
+            if lower.startswith((
+                "setup type:",
+                "scanner score:",
+                "market health filter:",
+                "suggested entry area:",
+                "suggested stop area:",
+                "suggested first target / sell zone:",
+                "approx position size:",
+                "wait for clean price behavior",
+                "use this as a shortlist tool",
+            )):
+                continue
+            if lower in {"things to watch:", "trade planning ideas:"}:
+                continue
+            if any(lower.startswith(prefix) for prefix in ["the overall market trend is not ideal", "recent price action is a bit wide", "earnings are coming soon"]):
+                continue
+
+            mapped = None
+            for needle, replacement in mapping:
+                if needle in lower:
+                    mapped = replacement
+                    break
+            if mapped:
+                extracted.append(mapped)
+
+        seen = set()
+        items = []
+        for item in extracted:
+            if item not in seen:
+                seen.add(item)
+                items.append(item)
+
+    if not items:
+        fallback_checks = [
+            (float(explanation.count("")) if False else None),
+        ]
+
+    if not items:
+        items = ["Strong technical structure", "Defined risk / reward plan"]
+
+    return items[:5]
+
+
+def render_why_pick_list(why_pick: str, explanation: str = "") -> str:
+    items = build_clean_why_pick_items(why_pick, explanation)
+    return "".join(
+        f"<li style='margin-bottom:6px;color:#cbd5e1;'>{item}</li>"
+        for item in items[:5]
+    )
+
+
+def render_why_pick_inline(why_pick: str, explanation: str = "") -> str:
+    items = build_clean_why_pick_items(why_pick, explanation)
+    return " • ".join(items[:4])
+
+
+def render_pick_detail_panel(row: dict, price_data: Dict[str, pd.DataFrame], rank_label: str):
+    symbol = str(row.get("symbol", ""))
+    price_df = price_data.get(symbol)
+
+    st.markdown(
+        f"""
+        <div style="
+            background: linear-gradient(180deg, #111827 0%, #0f172a 100%);
+            border: 1px solid rgba(255,255,255,0.08);
+            border-radius: 18px;
+            padding: 18px;
+            margin-bottom: 12px;
+            box-shadow: 0 10px 28px rgba(0,0,0,0.16);
+        ">
+            <div style="font-size:0.82rem;color:#93c5fd;margin-bottom:8px;">{rank_label} details</div>
+            <div style="display:grid;grid-template-columns:repeat(2,minmax(120px,1fr));gap:10px 18px;color:#d1d5db;font-size:0.95rem;line-height:1.55;">
+                <div><b>Entry:</b> {row.get('entry')}</div>
+                <div><b>Stop:</b> {row.get('stop')}</div>
+                <div><b>Target:</b> {row.get('target')}</div>
+                <div><b>Position Size:</b> {row.get('position_size_shares')} shares</div>
+                <div><b>Sector:</b> {row.get('sector')}</div>
+                <div><b>Confidence:</b> {row.get('confidence_score')} ({row.get('confidence_label')})</div>
+                <div><b>News:</b> {row.get('news_sentiment')} ({row.get('news_score')})</div>
+                <div><b>3M RS:</b> {row.get('rs_vs_benchmark_3m')}%</div>
+                <div><b>Volume Ratio:</b> {row.get('volume_ratio_today')}x</div>
+                <div style="grid-column:1 / -1;"><b>Catalysts:</b> {row.get('catalyst_tags') or 'None'}</div>
+                <div style="grid-column:1 / -1;"><b>Headline:</b> {row.get('news_headline') or 'No recent headline found'}</div>
+            </div>
+            <div style="margin-top:16px;">
+                <div style="font-size:0.85rem;color:#9ca3af;margin-bottom:8px;">Why this pick</div>
+                <ul style="margin:0;padding-left:18px;">
+                    {render_why_pick_list(row.get('why_pick', ''), row.get('explanation', ''))}
+                </ul>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    action_cols = st.columns(3)
+    with action_cols[0]:
+        if st.button(f"⭐ Save {symbol} to Watchlist", key=f"ideas_{rank_label}_{symbol}", use_container_width=True):
+            st.session_state.watchlist.append(symbol)
+            st.session_state.watchlist = sorted(list(dict.fromkeys([s.upper() for s in st.session_state.watchlist])))
+            Storage.save_watchlist(st.session_state.watchlist)
+            st.success(f"Added {symbol}")
+
+    with action_cols[1]:
+        if st.button(f"Add {symbol} to Journal", key=f"journal_{rank_label}_{symbol}", use_container_width=True):
+            journal_row = {
+                "date": datetime.now().strftime("%Y-%m-%d"),
+                "symbol": row.get("symbol", ""),
+                "entry": row.get("entry", ""),
+                "stop": row.get("stop", ""),
+                "target": row.get("target", ""),
+                "shares": row.get("position_size_shares", ""),
+                "setup_type": row.get("setup_type", ""),
+                "score": row.get("score", ""),
+                "status": "planned",
+                "notes": f"{row.get('notes', '')} | news={row.get('news_sentiment', 'Neutral')} ({row.get('news_score', 0)})",
+            }
+            Storage.add_journal_row(journal_row)
+            st.success(f"Added {symbol} to journal")
+
+    with action_cols[2]:
+        if price_df is not None and not price_df.empty:
+            if st.button(f"Save {symbol} Snapshot", key=f"snap_{rank_label}_{symbol}", use_container_width=True):
+                path = save_snapshot(symbol, price_df, row)
+                st.success(f"Saved to {path}")
+        else:
+            st.button("No Chart Data", key=f"nodata_{rank_label}_{symbol}", use_container_width=True, disabled=True)
+
+    if price_df is not None and not price_df.empty:
+        fig = build_chart(symbol, price_df, row)
+        st.pyplot(fig, clear_figure=True)
+
+    st.markdown("#### Trade Notes")
+    st.markdown(
+        f"""
+        <div style="
+            background: linear-gradient(180deg, #111827 0%, #0f172a 100%);
+            border: 1px solid rgba(255,255,255,0.08);
+            border-radius: 18px;
+            padding: 16px;
+            color: #e5e7eb;
+            white-space: pre-wrap;
+            line-height: 1.55;
+            box-shadow: 0 10px 28px rgba(0,0,0,0.16);
+            margin-bottom: 10px;
+        ">{row.get('explanation', '')}</div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_feed_pick_card(row: dict, price_data: Dict[str, pd.DataFrame], rank_number: int, hero: bool = False):
+    symbol = str(row.get("symbol", ""))
+    spark_uri = make_sparkline_data_uri(price_data.get(symbol))
+    badges = get_pick_badges(row)
+    badges.append(badge_html("Pro Selection", "purple") if hero else badge_html(f"Rank #{rank_number}", "purple"))
+
+    spark_html = (
+        f'<img src="{spark_uri}" style="width:100%;height:68px;display:block;" />'
+        if spark_uri
+        else '<div style="color:#9ca3af;font-size:0.85rem;">No sparkline</div>'
+    )
+
+    title = "Top Pick of the Day" if hero else f"Top Pick #{rank_number}"
+    subtitle = "Swipe-style feed card • tap below for full setup" if hero else "Ranked opportunity • tap below for full setup"
+
+    st.markdown(
+        f"""
+        <div style="
+            background: {'linear-gradient(135deg, #0f172a 0%, #111827 55%, #172554 100%)' if hero else 'linear-gradient(180deg, #111827 0%, #0f172a 100%)'};
+            border: 1px solid rgba(255,255,255,0.10);
+            border-radius: {'24px' if hero else '20px'};
+            padding: {'24px' if hero else '18px'};
+            margin-bottom: 14px;
+            box-shadow: 0 14px 34px rgba(0,0,0,0.20);
+        ">
+            <div style="font-size:0.86rem;color:#93c5fd;font-weight:700;margin-bottom:8px;">{title}</div>
+            <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:18px;flex-wrap:wrap;">
+                <div style="flex:1;min-width:260px;">
+                    <div style="font-size:{'2rem' if hero else '1.45rem'};font-weight:900;color:#f8fafc;margin-bottom:10px;">
+                        {symbol}
+                    </div>
+                    <div style="margin-bottom:12px;">{''.join(badges)}</div>
+                    <div style="display:grid;grid-template-columns:repeat(2,minmax(120px,1fr));gap:8px 18px;color:#d1d5db;font-size:0.96rem;line-height:1.6;">
+                        <div><b>Score:</b> {row.get('score')}</div>
+                        <div><b>Confidence:</b> {row.get('confidence_label')} ({row.get('confidence_score')})</div>
+                        <div><b>Setup:</b> {row.get('setup_type')}</div>
+                        <div><b>Close:</b> {row.get('close')}</div>
+                        <div><b>Target:</b> {row.get('target')}</div>
+                        <div><b>3M RS:</b> {row.get('rs_vs_benchmark_3m')}%</div>
+                        <div><b>Sector:</b> {row.get('sector')}</div>
+                        <div style="grid-column:1 / -1;"><b>Catalysts:</b> {row.get('catalyst_tags') or 'None'}</div>
+                        <div style="grid-column:1 / -1;"><b>Why this pick:</b> {render_why_pick_inline(row.get('why_pick', ''), row.get('explanation', ''))}</div>
+                    </div>
+                </div>
+                <div style="min-width:220px;flex:0 0 220px;">
+                    <div style="font-size:0.8rem;color:#9ca3af;margin-bottom:8px;">{subtitle}</div>
+                    <div style="
+                        background:#0b1220;
+                        border:1px solid rgba(255,255,255,0.08);
+                        border-radius:16px;
+                        padding:10px;
+                    ">
+                        {spark_html}
+                    </div>
+                </div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    expander_label = "Open full setup details" if hero else f"Open #{rank_number} full setup"
+    with st.expander(expander_label, expanded=hero):
+        render_pick_detail_panel(row, price_data, "Top Pick" if hero else f"Pick #{rank_number}")
+
+
 def render_top_pick_hero(results_df: pd.DataFrame, price_data: Dict[str, pd.DataFrame]):
+    results_df = ensure_results_schema(results_df)
     if results_df.empty:
         return
 
@@ -1589,174 +1610,24 @@ def render_top_pick_hero(results_df: pd.DataFrame, price_data: Dict[str, pd.Data
     if hero_df.empty:
         return
 
-    row = hero_df.iloc[0]
-    spark_uri = make_sparkline_data_uri(price_data.get(row["symbol"]))
-
-    badges = []
-    if row["score"] >= A_PLUS_SCORE:
-        badges.append(badge_html("🟢 A+ setup", "green"))
-    if bool(row.get("breakout_ready", False)):
-        badges.append(badge_html("🔥 Breakout ready", "red"))
-    if "Earnings in" in str(row.get("earnings_warning", "")):
-        badges.append(badge_html(f"⚠️ {row['earnings_warning']}", "yellow"))
-    if bool(row.get("market_ok", False)):
-        badges.append(badge_html("Market healthy", "blue"))
-    if int(row.get("news_score", 0)) >= 8:
-        badges.append(badge_html("📰 News confirmed", "green"))
-    elif int(row.get("news_score", 0)) <= -4:
-        badges.append(badge_html("📰 Headline risk", "yellow"))
-    if str(row.get("confidence_label", "")) == "High":
-        badges.append(badge_html("🎯 High confidence", "green"))
-    elif str(row.get("confidence_label", "")) == "Medium":
-        badges.append(badge_html("🎯 Medium confidence", "blue"))
-    badges.append(badge_html("Pro Selection", "purple"))
-
-    spark_html = (
-        f'<img src="{spark_uri}" style="width:220px;height:60px;display:block;" />'
-        if spark_uri
-        else '<div style="color:#9ca3af;font-size:0.85rem;">No sparkline</div>'
-    )
-
-    st.markdown("#### Top Pick of the Day")
-
-    st.markdown(
-        f"""
-        <div style="
-            background: linear-gradient(135deg, #0f172a 0%, #111827 55%, #172554 100%);
-            border: 1px solid rgba(255,255,255,0.10);
-            border-radius: 22px;
-            padding: 22px;
-            margin-bottom: 18px;
-            box-shadow: 0 14px 34px rgba(0,0,0,0.20);
-        ">
-            <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:24px;flex-wrap:wrap;">
-                <div style="flex:1;min-width:280px;">
-                    <div style="font-size:0.9rem;color:#93c5fd;font-weight:700;margin-bottom:6px;">
-                        AI-highlighted setup
-                    </div>
-                    <div style="font-size:2rem;font-weight:900;color:#f8fafc;margin-bottom:8px;">
-                        {row['symbol']}
-                    </div>
-                    <div style="margin-bottom:12px;">
-                        {''.join(badges)}
-                    </div>
-                    <div style="display:grid;grid-template-columns:repeat(2,minmax(120px,1fr));gap:8px 18px;color:#d1d5db;font-size:0.98rem;line-height:1.65;">
-                        <div><b>Score:</b> {row['score']}</div>
-                        <div><b>Tech / News:</b> {row.get('technical_score', row['score'])} / {row.get('news_score', 0)}</div>
-                        <div><b>Confidence:</b> {row.get('confidence_score', row['score'])} ({row.get('confidence_label', 'Watch')})</div>
-                        <div><b>Setup:</b> {row['setup_type']}</div>
-                        <div><b>Sector:</b> {row['sector']}</div>
-                        <div><b>Close:</b> {row['close']}</div>
-                        <div><b>Entry:</b> {row['entry']}</div>
-                        <div><b>Stop:</b> {row['stop']}</div>
-                        <div><b>3M RS:</b> {row['rs_vs_benchmark_3m']}%</div>
-                        <div><b>Position Size:</b> {row['position_size_shares']} shares</div>
-                        <div style="grid-column:1 / -1;"><b>Catalyst tags:</b> {row.get('catalyst_tags', 'None')}</div>
-                        <div style="grid-column:1 / -1;"><b>Headline:</b> {row.get('news_headline', 'No headline')}</div>
-                        <div style="grid-column:1 / -1;"><b>Why this pick:</b> {str(row.get('why_pick', '')).replace(' | ', ' • ')}</div>
-                    </div>
-                </div>
-                <div style="min-width:240px;">
-                    <div style="font-size:0.85rem;color:#9ca3af;margin-bottom:8px;">30-day sparkline</div>
-                    <div style="
-                        background:#0b1220;
-                        border:1px solid rgba(255,255,255,0.08);
-                        border-radius:16px;
-                        padding:10px;
-                        width:240px;
-                    ">
-                        {spark_html}
-                    </div>
-                </div>
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    row = hero_df.iloc[0].to_dict()
+    render_feed_pick_card(row, price_data, rank_number=1, hero=True)
 
 
-def render_top_picks(results_df: pd.DataFrame, price_data: Dict[str, pd.DataFrame], top_k: int = 5):
+def render_ranked_feed(results_df: pd.DataFrame, price_data: Dict[str, pd.DataFrame], top_n: int = 10):
+    results_df = ensure_results_schema(results_df)
     if results_df.empty:
         return
 
-    top_df = results_df.sort_values(
+    st.markdown("#### Ranked Feed")
+
+    ranked = results_df.sort_values(
         by=["score", "technical_score", "rs_vs_benchmark_3m", "volume_ratio_today"],
         ascending=[False, False, False, False],
-    ).head(top_k).copy()
+    ).head(top_n).reset_index(drop=True)
 
-    st.markdown("#### Top Picks")
-
-    cols = st.columns(len(top_df))
-    for i, (_, row) in enumerate(top_df.iterrows()):
-        badges = []
-        if row["score"] >= A_PLUS_SCORE:
-            badges.append(badge_html("🟢 A+ setup", "green"))
-        if bool(row.get("breakout_ready", False)):
-            badges.append(badge_html("🔥 Breakout", "red"))
-        if "Earnings in" in str(row.get("earnings_warning", "")):
-            badges.append(badge_html("⚠️ Earnings soon", "yellow"))
-        if int(row.get("news_score", 0)) >= 8:
-            badges.append(badge_html("📰 News confirmed", "green"))
-
-        spark_uri = make_sparkline_data_uri(price_data.get(row["symbol"]))
-        spark_html = (
-            f'<img src="{spark_uri}" style="width:100%;height:60px;display:block;" />'
-            if spark_uri
-            else '<div style="color:#9ca3af;font-size:0.85rem;">No sparkline</div>'
-        )
-
-        with cols[i]:
-            st.markdown(
-                f"""
-                <div style="
-                    background: linear-gradient(180deg, #111827 0%, #0f172a 100%);
-                    border: 1px solid rgba(255,255,255,0.08);
-                    border-radius: 18px;
-                    padding: 16px;
-                    min-height: 302px;
-                    box-shadow: 0 10px 28px rgba(0,0,0,0.16);
-                ">
-                    <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:8px;">
-                        <div style="font-size:1.15rem;font-weight:800;color:#f9fafb;">
-                            {row['symbol']}
-                        </div>
-                        <div style="font-size:0.9rem;font-weight:800;color:#93c5fd;">
-                            {row['score']}
-                        </div>
-                    </div>
-                    <div style="margin-bottom:10px;">
-                        {''.join(badges) if badges else badge_html("Watching", "blue")}
-                    </div>
-                    <div style="
-                        background:#0b1220;
-                        border:1px solid rgba(255,255,255,0.06);
-                        border-radius:14px;
-                        padding:8px;
-                        margin-bottom:12px;
-                        width:100%;
-                    ">
-                        {spark_html}
-                    </div>
-                    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px 14px;color:#d1d5db;font-size:0.92rem;">
-                        <div><b>Setup:</b><br>{row['setup_type']}</div>
-                        <div><b>Close:</b><br>{row['close']}</div>
-                        <div><b>3M RS:</b><br>{row['rs_vs_benchmark_3m']}%</div>
-                        <div><b>Sector:</b><br>{row['sector']}</div>
-                        <div><b>Confidence:</b><br>{row.get('confidence_label', 'Watch')} ({row.get('confidence_score', row['score'])})</div>
-                        <div><b>News:</b><br>{row.get('news_sentiment', 'Neutral')} ({row.get('news_score', 0)})</div>
-                        <div style="grid-column:1 / -1;"><b>Catalysts:</b><br>{row.get('catalyst_tags', 'None')}</div>
-                    </div>
-                    <div style="margin-top:10px;color:#cbd5e1;font-size:0.84rem;line-height:1.45;">
-                        {row.get('news_headline', 'No recent headline found')}
-                    </div>
-                    <div style="margin-top:8px;color:#93c5fd;font-size:0.8rem;line-height:1.45;">
-                        {str(row.get('why_pick', '')).replace(' | ', ' • ')}
-                    </div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
+    for idx, row in ranked.iterrows():
+        render_feed_pick_card(row.to_dict(), price_data, rank_number=idx + 1, hero=False)
 
 def render_stock_summary_card(row: dict):
     badges = []
@@ -1768,10 +1639,6 @@ def render_stock_summary_card(row: dict):
         badges.append(badge_html(f"⚠️ {row['earnings_warning']}", "yellow"))
     if bool(row.get("market_ok", False)):
         badges.append(badge_html("Market healthy", "blue"))
-    if int(row.get("news_score", 0)) >= 8:
-        badges.append(badge_html("📰 News confirmed", "green"))
-    elif int(row.get("news_score", 0)) <= -4:
-        badges.append(badge_html("📰 Headline risk", "yellow"))
 
     st.markdown(panel_open(f"{row['symbol']} Summary", "Selected idea at a glance"), unsafe_allow_html=True)
     st.markdown("".join(badges), unsafe_allow_html=True)
@@ -1785,16 +1652,9 @@ def render_stock_summary_card(row: dict):
             <div><b>Close</b><br>{row['close']}</div>
             <div><b>Entry</b><br>{row['entry']}</div>
             <div><b>Stop</b><br>{row['stop']}</div>
+            <div><b>Target</b><br>{row.get('target', '')}</div>
             <div><b>Risk / Share</b><br>{row['risk_per_share']}</div>
             <div><b>Position Size</b><br>{row['position_size_shares']}</div>
-            <div><b>News Sentiment</b><br>{row.get('news_sentiment', 'Neutral')}</div>
-            <div><b>News Score</b><br>{row.get('news_score', 0)}</div>
-            <div><b>Confidence</b><br>{row.get('confidence_label', 'Watch')} ({row.get('confidence_score', row.get('score', 0))})</div>
-            <div><b>Catalyst Tags</b><br>{row.get('catalyst_tags', 'None')}</div>
-        </div>
-        <div class="sspx-divider"></div>
-        <div style="font-size:0.92rem;color:#cbd5e1;line-height:1.55;">
-            <b>Why this pick:</b><br>• {str(row.get('why_pick', 'No explanation yet')).replace(' | ', '<br>• ')}
         </div>
         """,
         unsafe_allow_html=True,
@@ -1809,25 +1669,14 @@ def render_stock_details_cards(row: dict):
     with row1[0]:
         st.markdown(metric_card("Score", row["score"], row["score"] >= A_PLUS_SCORE), unsafe_allow_html=True)
     with row1[1]:
-        st.markdown(metric_card("Technical Score", row.get("technical_score", row["score"])), unsafe_allow_html=True)
-    with row1[2]:
-        news_score = int(row.get("news_score", 0))
-        st.markdown(metric_card("News Score", news_score, news_score >= 0), unsafe_allow_html=True)
-    with row1[3]:
-        st.markdown(metric_card("News Sentiment", row.get("news_sentiment", "Neutral")), unsafe_allow_html=True)
-
-    row1b = st.columns(4)
-    with row1b[0]:
         st.markdown(metric_card("Close", row["close"]), unsafe_allow_html=True)
-    with row1b[1]:
+    with row1[2]:
         st.markdown(metric_card("Setup", row["setup_type"]), unsafe_allow_html=True)
-    with row1b[2]:
+    with row1[3]:
         st.markdown(
             metric_card("Breakout Ready", "Yes" if row["breakout_ready"] else "No", row["breakout_ready"]),
             unsafe_allow_html=True,
         )
-    with row1b[3]:
-        st.markdown(metric_card("Sector", row.get("sector", "")), unsafe_allow_html=True)
 
     row2 = st.columns(4)
     with row2[0]:
@@ -1864,33 +1713,7 @@ def render_stock_details_cards(row: dict):
         trend = float(row.get("trend_strength", 0))
         st.markdown(metric_card("Trend Strength", trend, trend >= 0), unsafe_allow_html=True)
     with row4[3]:
-        st.markdown(metric_card("News Count", row.get("news_count", 0)), unsafe_allow_html=True)
-
-    st.markdown("#### News Catalyst")
-    news_link = row.get("news_link", "")
-    news_line = row.get("news_headline", "No recent headline found")
-    if news_link:
-        news_line = f"<a href='{news_link}' target='_blank' style='color:#93c5fd;text-decoration:none;'>{news_line}</a>"
-
-    st.markdown(
-        f"""
-        <div style="
-            background: linear-gradient(180deg, #111827 0%, #0f172a 100%);
-            border: 1px solid rgba(255,255,255,0.08);
-            border-radius: 18px;
-            padding: 18px;
-            color: #e5e7eb;
-            line-height: 1.55;
-            box-shadow: 0 10px 28px rgba(0,0,0,0.16);
-            margin-bottom: 16px;
-        ">
-            <div style="font-size:0.82rem;color:#9ca3af;margin-bottom:8px;">Latest headline</div>
-            <div style="font-size:1rem;font-weight:700;margin-bottom:8px;">{news_line}</div>
-            <div style="font-size:0.92rem;color:#cbd5e1;">Sentiment: {row.get('news_sentiment', 'Neutral')} | Score impact: {row.get('news_score', 0)}</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+        st.markdown(metric_card("Sector", row.get("sector", "")), unsafe_allow_html=True)
 
     st.markdown("#### Trade Notes")
     st.markdown(
@@ -1953,7 +1776,6 @@ def render_results_table(results_df: pd.DataFrame):
     ]
 
     table_df = results_df[view_cols].copy()
-    table_df["score"] = results_df["score"]
 
     ticker_cell = JsCode(
         """
@@ -2040,68 +1862,35 @@ def sidebar_controls():
         only_market_ok = st.toggle("Only show market-healthy names", value=False)
         min_score_filter = st.slider("Minimum score", min_value=0, max_value=100, value=0, step=1)
 
-        st.divider()
-        use_news_confirmation = st.toggle(
-            "Use news confirmation",
-            value=st.session_state.use_news_confirmation,
-            help="Adds a small news-based confirmation bonus or risk penalty to the technical score.",
-        )
-        strict_news_mode = st.toggle(
-            "Strict news mode",
-            value=st.session_state.strict_news_mode,
-            help="Filters out names with clearly negative headline risk after the technical scan.",
-        )
-
         st.session_state.selected_benchmark = selected_benchmark
         st.session_state.min_score_filter = min_score_filter
-        st.session_state.use_news_confirmation = use_news_confirmation
-        st.session_state.strict_news_mode = strict_news_mode
 
         st.divider()
         st.markdown(badge_html("Pro Workspace", "purple"), unsafe_allow_html=True)
         st.markdown(INFO_TEXT)
 
-    return (
-        account_size,
-        risk_percent,
-        top_n,
-        only_a_plus,
-        only_breakout,
-        only_market_ok,
-        selected_benchmark,
-        min_score_filter,
-        use_news_confirmation,
-        strict_news_mode,
-    )
+    return account_size, risk_percent, top_n, only_a_plus, only_breakout, only_market_ok, selected_benchmark, min_score_filter
 
 
-def scanner_tab(
-    account_size,
-    risk_percent,
-    top_n,
-    only_a_plus,
-    only_breakout,
-    only_market_ok,
-    selected_benchmark,
-    min_score_filter,
-    use_news_confirmation,
-    strict_news_mode,
-):
+
+def scanner_tab(account_size, risk_percent, top_n, only_a_plus, only_breakout, only_market_ok, selected_benchmark, min_score_filter):
     st.subheader("Scanner")
 
     st.markdown(
         """
         <div class="scanner-card">
             <div style="display:flex;justify-content:space-between;align-items:center;gap:18px;flex-wrap:wrap;">
-                <div>
-                    <div style="font-size:1.1rem;font-weight:700;margin-bottom:0.35rem;">S&amp;P 500 Scanner</div>
-                    <div class="scanner-subtle">Institutional-style momentum ranking for breakout and continuation setups.</div>
+                <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+                    <div style="width:38px;height:38px;border-radius:999px;background:#111827;border:1px solid rgba(255,255,255,0.08);display:flex;align-items:center;justify-content:center;font-size:1rem;">👤</div>
+                    <div>
+                        <div style="font-size:1.1rem;font-weight:700;margin-bottom:0.35rem;">Swing Scanner Pro X</div>
+                        <div class="scanner-subtle">Press Scan Now, get the top idea first, then scroll the ranked feed.</div>
+                    </div>
                 </div>
-                <div style="display:flex;gap:8px;flex-wrap:wrap;">
+                <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+                    <span class="sspx-chip">⚙️ Settings</span>
                     <span class="sspx-chip">Dark Premium UI</span>
-                    <span class="sspx-chip">AgGrid Selection</span>
-                    <span class="sspx-chip">SaaS Layout</span>
-                    <span class="sspx-chip">News Confirmation</span>
+                    <span class="sspx-chip">Feed Layout</span>
                 </div>
             </div>
         </div>
@@ -2112,7 +1901,7 @@ def scanner_tab(
     top_left, top_right = st.columns([1, 2.2])
 
     with top_left:
-        if st.button("Run S&P 500 Scan", type="primary", use_container_width=True):
+        if st.button("Scan Now", type="primary", use_container_width=True):
             symbols = UniverseLoader.get_sp500_symbols()
             with st.spinner(f"Scanning {len(symbols)} S&P 500 stocks..."):
                 results_df, price_data, logs, alerts = run_scan_logic(
@@ -2120,8 +1909,6 @@ def scanner_tab(
                     account_size,
                     risk_percent,
                     selected_benchmark=selected_benchmark,
-                    use_news_confirmation=use_news_confirmation,
-                    strict_news_mode=strict_news_mode,
                 )
                 st.session_state.results_df = results_df
                 st.session_state.price_data = price_data
@@ -2137,17 +1924,22 @@ def scanner_tab(
         st.markdown(
             f"""
             <div class="sspx-panel" style="margin-bottom:0;">
-                <div style="font-size:0.95rem;color:#d1d5db;line-height:1.65;">
-                    Run the scan, review the AI-ranked ideas, then click any ticker to inspect the chart and trade plan.
-                    Current benchmark mode: <span style="color:#93c5fd;font-weight:700;">{selected_benchmark}</span><br>
-                    News layer: <span style="color:#93c5fd;font-weight:700;">{'On' if use_news_confirmation else 'Off'}</span>
+                <div style="font-size:1rem;color:#f8fafc;font-weight:800;margin-bottom:6px;">How this version works</div>
+                <div style="font-size:0.95rem;color:#d1d5db;line-height:1.7;">
+                    Tap <span style="color:#93c5fd;font-weight:700;">Scan Now</span>, review the
+                    <span style="color:#93c5fd;font-weight:700;">Top Pick of the Day</span>, then
+                    scroll a ranked feed of the next best setups. Each card opens into a fuller
+                    setup view with chart, trade plan, and save actions.
+                    <br><br>
+                    Current benchmark mode:
+                    <span style="color:#93c5fd;font-weight:700;">{selected_benchmark}</span>
                 </div>
             </div>
             """,
             unsafe_allow_html=True,
         )
 
-    results_df = st.session_state.results_df.copy()
+    results_df = ensure_results_schema(st.session_state.results_df.copy())
 
     if not results_df.empty:
         if only_a_plus:
@@ -2166,7 +1958,7 @@ def scanner_tab(
         if sector_filter != "All":
             results_df = results_df[results_df["sector"] == sector_filter]
 
-        results_df = results_df.head(top_n).reset_index(drop=True)
+        results_df = results_df.head(max(10, top_n)).reset_index(drop=True)
 
     render_market_status_bar(results_df)
 
@@ -2175,105 +1967,22 @@ def scanner_tab(
     else:
         render_scan_kpis(results_df)
         render_top_pick_hero(results_df, st.session_state.price_data)
-        render_top_picks(results_df, st.session_state.price_data, top_k=min(5, len(results_df)))
+        render_ranked_feed(results_df, st.session_state.price_data, top_n=min(10, len(results_df)))
 
-        st.markdown("#### Results")
-        left_results, right_results = st.columns([2.1, 1])
+        st.markdown("#### Feed Stats")
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            st.metric("Top score", int(results_df["score"].max()))
+        with c2:
+            st.metric("A+ names", int((results_df["score"] >= A_PLUS_SCORE).sum()))
+        with c3:
+            st.metric("Median score", round(float(results_df["score"].median()), 1))
+        with c4:
+            st.metric("Breakout-ready", int(results_df["breakout_ready"].sum()))
 
-        with left_results:
-            grid_response = render_results_table(results_df)
-
-        with right_results:
-            c1, c2 = st.columns(2)
-
-            with c1:
-                st.metric("Top score", int(results_df["score"].max()))
-                st.metric("A+ names", int((results_df["score"] >= A_PLUS_SCORE).sum()))
-
-            with c2:
-                st.metric("Median score", round(float(results_df["score"].median()), 1))
-                st.metric("Breakout-ready", int(results_df["breakout_ready"].sum()))
-
-        selected_rows = grid_response.get("selected_rows", [])
-
-        if selected_rows is not None:
-            if isinstance(selected_rows, pd.DataFrame):
-                if not selected_rows.empty and "symbol" in selected_rows.columns:
-                    st.session_state.selected_symbol = str(selected_rows.iloc[0]["symbol"])
-            elif isinstance(selected_rows, list):
-                if len(selected_rows) > 0 and isinstance(selected_rows[0], dict) and "symbol" in selected_rows[0]:
-                    st.session_state.selected_symbol = str(selected_rows[0]["symbol"])
-
-        selected_symbol = st.session_state.selected_symbol
-
-        if selected_symbol and selected_symbol in results_df["symbol"].values:
-            row = results_df[results_df["symbol"] == selected_symbol].iloc[0].to_dict()
-            price_df = st.session_state.price_data.get(selected_symbol)
-
-            st.markdown("---")
-            st.markdown(f"#### Analysis Workspace — {selected_symbol}")
-
-            top_analysis_left, top_analysis_right = st.columns([2.15, 1])
-
-            with top_analysis_left:
-                st.markdown(panel_open("Chart", "180-day price structure + strength line"), unsafe_allow_html=True)
-                if price_df is not None and not price_df.empty:
-                    fig = build_chart(selected_symbol, price_df, row)
-                    st.pyplot(fig, clear_figure=True)
-                else:
-                    st.warning("No chart data available.")
-                st.markdown(panel_close(), unsafe_allow_html=True)
-
-            with top_analysis_right:
-                render_stock_summary_card(row)
-
-                st.markdown(panel_open("Actions", "Portfolio workflow shortcuts"), unsafe_allow_html=True)
-                c1, c2 = st.columns(2)
-                with c1:
-                    if st.button("Save Snapshot", use_container_width=True):
-                        if price_df is not None and not price_df.empty:
-                            path = save_snapshot(selected_symbol, price_df, row)
-                            st.success(f"Saved to {path}")
-                        else:
-                            st.warning("No chart available to save.")
-                with c2:
-                    if st.button("Add to Ideas", use_container_width=True):
-                        st.session_state.watchlist.append(selected_symbol)
-                        st.session_state.watchlist = sorted(
-                            list(dict.fromkeys([s.upper() for s in st.session_state.watchlist]))
-                        )
-                        Storage.save_watchlist(st.session_state.watchlist)
-                        st.success(f"Added {selected_symbol}")
-
-                c3, c4 = st.columns(2)
-                with c3:
-                    if st.button("Add to Journal", use_container_width=True):
-                        journal_row = {
-                            "date": datetime.now().strftime("%Y-%m-%d"),
-                            "symbol": row.get("symbol", ""),
-                            "entry": row.get("entry", ""),
-                            "stop": row.get("stop", ""),
-                            "target": round(float(row.get("entry", 0)) * 1.12, 2) if row.get("entry", 0) else "",
-                            "shares": row.get("position_size_shares", ""),
-                            "setup_type": row.get("setup_type", ""),
-                            "score": row.get("score", ""),
-                            "status": "planned",
-                            "notes": f"{row.get('notes', '')} | news={row.get('news_sentiment', 'Neutral')} ({row.get('news_score', 0)})",
-                        }
-                        Storage.add_journal_row(journal_row)
-                        st.success(f"Added {selected_symbol} to journal")
-                with c4:
-                    csv = results_df.to_csv(index=False).encode("utf-8")
-                    st.download_button(
-                        "CSV Export",
-                        csv,
-                        file_name="swing_scan_results.csv",
-                        mime="text/csv",
-                        use_container_width=True,
-                    )
-                st.markdown(panel_close(), unsafe_allow_html=True)
-
-            render_stock_details_cards(row)
+        with st.expander("Advanced Table View"):
+            st.markdown("For desktop review only.")
+            render_results_table(results_df)
 
         render_premium_modules()
 
@@ -2282,7 +1991,6 @@ def scanner_tab(
             st.code("\n".join(st.session_state.logs))
         else:
             st.write("No logs yet.")
-
 
 def ideas_tab():
     st.subheader("Ideas")
@@ -2314,8 +2022,6 @@ def ideas_tab():
                         account_size=10000.0,
                         risk_percent=1.0,
                         selected_benchmark=st.session_state.selected_benchmark,
-                        use_news_confirmation=st.session_state.use_news_confirmation,
-                        strict_news_mode=st.session_state.strict_news_mode,
                     )
                     st.session_state.results_df = results_df
                     st.session_state.price_data = price_data
@@ -2397,8 +2103,6 @@ def main():
         only_market_ok,
         selected_benchmark,
         min_score_filter,
-        use_news_confirmation,
-        strict_news_mode,
     ) = sidebar_controls()
 
     render_app_header()
@@ -2414,8 +2118,6 @@ def main():
             only_market_ok,
             selected_benchmark,
             min_score_filter,
-            use_news_confirmation,
-            strict_news_mode,
         )
     with tab2:
         ideas_tab()
