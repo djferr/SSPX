@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import textwrap
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from datetime import date, datetime
@@ -1531,80 +1532,108 @@ def render_pick_detail_panel(row: dict, price_data: Dict[str, pd.DataFrame], ran
     )
 
 
+
 def render_feed_pick_card(row: dict, price_data: Dict[str, pd.DataFrame], rank_number: int, hero: bool = False):
     symbol = str(row.get("symbol", ""))
     spark_uri = make_sparkline_data_uri(price_data.get(symbol))
     badges = get_pick_badges(row)
     badges.append(badge_html("Top Pick", "purple") if hero else badge_html(f"Pick #{rank_number}", "purple"))
 
-    spark_html = (
-        f'<img src="{spark_uri}" style="width:100%;height:{84 if hero else 76}px;display:block;" />'
-        if spark_uri
-        else '<div style="color:#9ca3af;font-size:0.85rem;">No sparkline</div>'
-    )
-
     title = "Top Pick of the Day" if hero else f"Pick #{rank_number}"
+    confidence_label = str(row.get("confidence_label", ""))
+    if confidence_label == "High":
+        confidence_text = "High confidence"
+    elif confidence_label == "Medium":
+        confidence_text = "Medium confidence"
+    else:
+        confidence_text = "Tracking"
+
+    setup_type = str(row.get("setup_type", "Mixed Setup"))
+    score_value = row.get("score", 0)
+    target_value = row.get("target", 0)
+    close_value = row.get("close", 0)
+    rs_value = row.get("rs_vs_benchmark_3m", 0)
 
     st.markdown(
         f"""
         <div style="
-            background: {'linear-gradient(135deg, #0f172a 0%, #111827 55%, #172554 100%)' if hero else 'linear-gradient(180deg, #111827 0%, #0f172a 100%)'};
+            background: {'linear-gradient(135deg, #081425 0%, #0f172a 48%, #172554 100%)' if hero else 'linear-gradient(180deg, #0f172a 0%, #0c1527 100%)'};
             border: 1px solid rgba(255,255,255,0.10);
-            border-radius: {'24px' if hero else '20px'};
-            padding: {'24px' if hero else '18px'};
+            border-radius: {'26px' if hero else '20px'};
+            padding: {'20px' if hero else '16px'};
             margin-bottom: 12px;
-            box-shadow: 0 14px 34px rgba(0,0,0,0.20);
+            box-shadow: {'0 22px 60px rgba(0,0,0,0.26)' if hero else '0 14px 34px rgba(0,0,0,0.20)'};
         ">
-            <div style="font-size:0.86rem;color:#93c5fd;font-weight:700;margin-bottom:8px;">{title}</div>
-            <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:18px;flex-wrap:wrap;">
-                <div style="flex:1;min-width:260px;">
-                    <div style="font-size:{'2.15rem' if hero else '1.55rem'};font-weight:900;color:#f8fafc;margin-bottom:12px;letter-spacing:-0.02em;">
-                        {symbol}
-                    </div>
-                    <div style="margin-bottom:14px;">{''.join(badges)}</div>
-                </div>
-                <div style="min-width:240px;flex:0 0 240px;">
-                    <div style="
-                        background:#0b1220;
-                        border:1px solid rgba(255,255,255,0.08);
-                        border-radius:16px;
-                        padding:10px;
-                    ">
-                        {spark_html}
-                    </div>
-                </div>
+            <div style="font-size:0.86rem;color:#93c5fd;font-weight:800;margin-bottom:8px;letter-spacing:0.03em;">{title}</div>
+            <div style="font-size:{'2.5rem' if hero else '1.6rem'};font-weight:950;color:#f8fafc;margin-bottom:12px;letter-spacing:-0.03em;line-height:1;">
+                {symbol}
             </div>
+            <div style="margin-bottom:12px;">{''.join(badges)}</div>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-    quick_label = "Tap for quick view" if hero else f"Tap for Pick #{rank_number} quick view"
-    detail_key = f"show_breakdown_{symbol}_{rank_number}_{'hero' if hero else 'feed'}"
-    with st.expander(quick_label, expanded=hero):
+    info_cols = st.columns([1.15, 1.15, 1.15, 1.1] if hero else [1, 1, 1, 1])
+    with info_cols[0]:
+        st.markdown(info_tile("Score", f"{score_value}"), unsafe_allow_html=True)
+    with info_cols[1]:
+        st.markdown(info_tile("Setup", f"{setup_type}"), unsafe_allow_html=True)
+    with info_cols[2]:
+        st.markdown(info_tile("Target", f"{target_value}"), unsafe_allow_html=True)
+    with info_cols[3]:
+        st.markdown(info_tile("Confidence", confidence_text), unsafe_allow_html=True)
+
+    meta_left, meta_right = st.columns([1.35, 0.65])
+    with meta_left:
         st.markdown(
             f"""
-            <div style="
-                background: linear-gradient(180deg, #111827 0%, #0f172a 100%);
-                border: 1px solid rgba(255,255,255,0.08);
-                border-radius: 18px;
-                padding: 18px;
-                margin-bottom: 12px;
-                box-shadow: 0 10px 28px rgba(0,0,0,0.16);
-            ">
-                <div style="display:grid;grid-template-columns:repeat(2,minmax(120px,1fr));gap:10px 18px;color:#d1d5db;font-size:0.96rem;line-height:1.6;">
-                    <div><b>Score:</b> {row.get('score')}</div>
-                    <div><b>Setup:</b> {row.get('setup_type')}</div>
-                    <div><b>Confidence:</b> {row.get('confidence_label')}</div>
-                    <div><b>Target:</b> {row.get('target')}</div>
-                    <div><b>Close:</b> {row.get('close')}</div>
-                    <div><b>3M RS:</b> {row.get('rs_vs_benchmark_3m')}%</div>
-                    <div style="grid-column:1 / -1;"><b>Tags:</b> {row.get('catalyst_tags') or 'None'}</div>
+            <div class="sspx-panel" style="margin-top:4px;">
+                <div style="display:flex;gap:18px;flex-wrap:wrap;color:#cbd5e1;font-size:0.95rem;">
+                    <div><span style="color:#94a3b8;">Close</span> <span style="font-weight:800;color:#f8fafc;">{close_value}</span></div>
+                    <div><span style="color:#94a3b8;">3M RS</span> <span style="font-weight:800;color:#f8fafc;">{rs_value}%</span></div>
+                    <div><span style="color:#94a3b8;">Confidence</span> <span style="font-weight:800;color:#f8fafc;">{confidence_text}</span></div>
                 </div>
             </div>
             """,
             unsafe_allow_html=True,
         )
+    with meta_right:
+        st.markdown('<div style="font-size:0.8rem;color:#9ca3af;margin:6px 0 8px 0;">' + ('30-day momentum' if hero else '30-day sparkline') + '</div>', unsafe_allow_html=True)
+        if spark_uri:
+            st.markdown(
+                f"""
+                <div style="background:#09111f;border:1px solid rgba(255,255,255,0.08);border-radius:18px;padding:12px;">
+                    <img src="{spark_uri}" style="width:100%;height:{96 if hero else 76}px;display:block;" />
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown('<div class="sspx-panel">No sparkline</div>', unsafe_allow_html=True)
+
+    quick_label = "Tap for quick view" if hero else f"Tap for Pick #{rank_number} quick view"
+    detail_key = f"show_breakdown_{symbol}_{rank_number}_{'hero' if hero else 'feed'}"
+    with st.expander(quick_label, expanded=hero):
+        q1, q2 = st.columns(2)
+        with q1:
+            st.markdown(metric_card("Score", row.get("score")), unsafe_allow_html=True)
+            st.markdown(metric_card("Confidence", row.get("confidence_label") or "Tracking"), unsafe_allow_html=True)
+            st.markdown(metric_card("Close", row.get("close")), unsafe_allow_html=True)
+        with q2:
+            st.markdown(metric_card("Setup", row.get("setup_type")), unsafe_allow_html=True)
+            st.markdown(metric_card("Target", row.get("target")), unsafe_allow_html=True)
+            st.markdown(metric_card("3M RS", f"{row.get('rs_vs_benchmark_3m')}%"), unsafe_allow_html=True)
+
+        st.markdown(
+            f"""
+            <div class="sspx-panel" style="margin-top:10px;">
+                <div><b>Tags:</b> {row.get('catalyst_tags') or 'None'}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
         btn_label = "Show full breakdown" if hero else f"Show Pick #{rank_number} full breakdown"
         detail_state_key = f"{detail_key}_open"
         button_key = f"{detail_key}_button"
@@ -1890,41 +1919,98 @@ def sidebar_controls():
 
 
 
-def scanner_tab(account_size, risk_percent, top_n, only_a_plus, only_breakout, only_market_ok, selected_benchmark, min_score_filter):
-    st.subheader("Scanner")
 
+
+def render_clean_header():
     st.markdown(
-        """
-        <div class="scanner-card">
-            <div style="display:flex;justify-content:space-between;align-items:center;gap:18px;flex-wrap:wrap;">
-                <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
-                    <div style="width:38px;height:38px;border-radius:999px;background:#111827;border:1px solid rgba(255,255,255,0.08);display:flex;align-items:center;justify-content:center;font-size:1rem;">👤</div>
-                    <div>
-                        <div style="font-size:1.1rem;font-weight:700;margin-bottom:0.35rem;">Swing Scanner Pro X</div>
-                        <div class="scanner-subtle">Press Scan Now, get the top idea first, then scroll the ranked feed.</div>
-                    </div>
-                </div>
-                <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
-                    <span class="sspx-chip">⚙️ Settings</span>
-                    <span class="sspx-chip">Dark Premium UI</span>
-                    <span class="sspx-chip">Feed Layout</span>
-                </div>
+        f"""
+        <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:18px;flex-wrap:wrap;margin-top:8px;margin-bottom:18px;">
+            <div>
+                <div style="font-size:2.45rem;font-weight:900;line-height:1.05;color:#f8fafc;">{APP_TITLE}</div>
+                <div style="font-size:1.05rem;color:#9fb4d9;margin-top:10px;">{APP_TAGLINE}</div>
+            </div>
+            <div style="display:flex;gap:10px;align-items:center;">
+                <span class="sspx-chip">👤 Profile</span>
+                <span class="sspx-chip">⚙️ Settings</span>
             </div>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-    top_left, top_right = st.columns([1, 2.2])
 
-    with top_left:
-        if st.button("Scan Now", type="primary", use_container_width=True):
-            symbols = UniverseLoader.get_sp500_symbols()
-            with st.spinner(f"Scanning {len(symbols)} S&P 500 stocks..."):
-                results_df, price_data, logs, alerts = run_scan_logic(
-                    symbols,
-                    account_size,
-                    risk_percent,
+
+def run_scan_with_premium_feedback(account_size: float, risk_percent: float, selected_benchmark: str):
+    symbols = UniverseLoader.get_sp500_symbols()
+    status_box = st.empty()
+    progress_box = st.empty()
+    stage_steps = [
+        ("Loading S&P 500 universe", 8),
+        ("Pulling price history", 28),
+        ("Scoring technical setups", 58),
+        ("Ranking strongest candidates", 82),
+        ("Packaging top ideas", 100),
+    ]
+    progress = progress_box.progress(0, text="Preparing scan...")
+    for message, pct in stage_steps[:2]:
+        status_box.markdown(
+            f"""
+            <div class="sspx-panel" style="margin-top:12px;padding:14px 16px;">
+                <div style="font-size:0.88rem;color:#93c5fd;font-weight:700;letter-spacing:0.03em;text-transform:uppercase;">Scanning engine</div>
+                <div style="font-size:1.12rem;color:#f8fafc;font-weight:800;margin-top:4px;">{message}</div>
+                <div style="font-size:0.92rem;color:#9ca3af;margin-top:6px;">Reviewing {len(symbols)} names with your current rules.</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        progress.progress(pct, text=message)
+
+    with st.spinner(f"Scanning {len(symbols)} S&P 500 stocks..."):
+        results_df, price_data, logs, alerts = run_scan_logic(
+            symbols,
+            account_size,
+            risk_percent,
+            selected_benchmark=selected_benchmark,
+        )
+
+    for message, pct in stage_steps[2:]:
+        status_box.markdown(
+            f"""
+            <div class="sspx-panel" style="margin-top:12px;padding:14px 16px;">
+                <div style="font-size:0.88rem;color:#93c5fd;font-weight:700;letter-spacing:0.03em;text-transform:uppercase;">Scanning engine</div>
+                <div style="font-size:1.12rem;color:#f8fafc;font-weight:800;margin-top:4px;">{message}</div>
+                <div style="font-size:0.92rem;color:#9ca3af;margin-top:6px;">Finalizing today's ranked opportunity feed.</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        progress.progress(pct, text=message)
+
+    status_box.markdown(
+        f"""
+        <div class="sspx-panel" style="margin-top:12px;padding:14px 16px;border:1px solid rgba(134,239,172,0.25);">
+            <div style="font-size:0.88rem;color:#86efac;font-weight:700;letter-spacing:0.03em;text-transform:uppercase;">Scan complete</div>
+            <div style="font-size:1.12rem;color:#f8fafc;font-weight:800;margin-top:4px;">{len(results_df)} ranked setups ready</div>
+            <div style="font-size:0.92rem;color:#9ca3af;margin-top:6px;">Opening your top pick and ranked feed now.</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    progress.progress(100, text="Scan complete")
+    return results_df, price_data, logs, alerts
+
+
+def scanner_tab(account_size, risk_percent, top_n, only_a_plus, only_breakout, only_market_ok, selected_benchmark, min_score_filter):
+    results_df = ensure_results_schema(st.session_state.results_df.copy())
+    has_results = not results_df.empty
+
+    if not has_results:
+        _, mid, _ = st.columns([1.2, 2.4, 1.2])
+        with mid:
+            if st.button("Scan Now", type="primary", use_container_width=True):
+                results_df, price_data, logs, alerts = run_scan_with_premium_feedback(
+                    account_size=account_size,
+                    risk_percent=risk_percent,
                     selected_benchmark=selected_benchmark,
                 )
                 st.session_state.results_df = results_df
@@ -1933,54 +2019,46 @@ def scanner_tab(account_size, risk_percent, top_n, only_a_plus, only_breakout, o
                 st.session_state.alerts = alerts
                 if not results_df.empty:
                     st.session_state.selected_symbol = results_df.iloc[0]["symbol"]
-            st.rerun()
+                st.rerun()
 
-        render_scoring_explainer()
-
-    with top_right:
-        st.markdown(
-            f"""
-            <div class="sspx-panel" style="margin-bottom:0;">
-                <div style="font-size:1rem;color:#f8fafc;font-weight:800;margin-bottom:6px;">How this version works</div>
-                <div style="font-size:0.95rem;color:#d1d5db;line-height:1.7;">
-                    Tap <span style="color:#93c5fd;font-weight:700;">Scan Now</span>, review the
-                    <span style="color:#93c5fd;font-weight:700;">Top Pick of the Day</span>, then
-                    review the Top Pick of the Day first, then scroll through the ranked picks.
-                    Each pick gives a quick view first, with a full breakdown available after that.
-                    <br><br>
-                    Current benchmark mode:
-                    <span style="color:#93c5fd;font-weight:700;">{selected_benchmark}</span>
+        c1, c2 = st.columns([1.05, 1.35])
+        with c1:
+            render_scoring_explainer()
+        with c2:
+            st.markdown(
+                f"""
+                <div class="sspx-panel" style="min-height:124px;">
+                    <div style="font-size:1rem;color:#f8fafc;font-weight:800;margin-bottom:8px;">How this version works</div>
+                    <div style="font-size:0.95rem;color:#d1d5db;line-height:1.75;">
+                        Tap <span style="color:#93c5fd;font-weight:700;">Scan Now</span> to launch the ranking engine. We’ll surface your top setup first, then open the full ranked feed.
+                    </div>
                 </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+                """,
+                unsafe_allow_html=True,
+            )
 
-    results_df = ensure_results_schema(st.session_state.results_df.copy())
+        st.stop()
 
-    if not results_df.empty:
-        if only_a_plus:
-            results_df = results_df[results_df["score"] >= A_PLUS_SCORE]
-        if only_breakout:
-            results_df = results_df[results_df["breakout_ready"] == True]
-        if only_market_ok:
-            results_df = results_df[results_df["market_ok"] == True]
-        if min_score_filter > 0:
-            results_df = results_df[results_df["score"] >= min_score_filter]
+    if only_a_plus:
+        results_df = results_df[results_df["score"] >= A_PLUS_SCORE]
+    if only_breakout:
+        results_df = results_df[results_df["breakout_ready"] == True]
+    if only_market_ok:
+        results_df = results_df[results_df["market_ok"] == True]
+    if min_score_filter > 0:
+        results_df = results_df[results_df["score"] >= min_score_filter]
 
-        sectors = ["All"] + sorted(
-            [s for s in results_df["sector"].dropna().unique().tolist() if str(s).strip()]
-        )
-        sector_filter = st.selectbox("Sector filter", sectors)
-        if sector_filter != "All":
-            results_df = results_df[results_df["sector"] == sector_filter]
+    sectors = ["All"] + sorted([s for s in results_df["sector"].dropna().unique().tolist() if str(s).strip()])
+    sector_filter = st.selectbox("Sector filter", sectors)
+    if sector_filter != "All":
+        results_df = results_df[results_df["sector"] == sector_filter]
 
-        results_df = results_df.head(max(10, top_n)).reset_index(drop=True)
+    results_df = results_df.head(max(10, top_n)).reset_index(drop=True)
 
     render_market_status_bar(results_df)
 
     if results_df.empty:
-        st.info("No scan results yet.")
+        st.info("No scan results match your current filters.")
     else:
         render_scan_kpis(results_df)
         render_top_pick_hero(results_df, st.session_state.price_data)
@@ -2008,6 +2086,7 @@ def scanner_tab(account_size, risk_percent, top_n, only_a_plus, only_breakout, o
             st.code("\n".join(st.session_state.logs))
         else:
             st.write("No logs yet.")
+
 
 def ideas_tab():
     st.subheader("Ideas")
@@ -2106,10 +2185,11 @@ def signals_tab():
 
 
 def main():
-    st.set_page_config(page_title=APP_TITLE, layout="wide")
+    st.set_page_config(page_title=APP_TITLE, layout="wide", initial_sidebar_state="collapsed")
     os.makedirs(SNAPSHOT_DIR, exist_ok=True)
     ensure_state()
     inject_dark_theme()
+    render_clean_header()
 
     (
         account_size,
@@ -2122,10 +2202,9 @@ def main():
         min_score_filter,
     ) = sidebar_controls()
 
-    render_app_header()
+    has_results = not st.session_state.results_df.empty
 
-    tab1, tab2, tab3, tab4 = st.tabs(["Scanner", "Ideas", "Journal", "Signals"])
-    with tab1:
+    if not has_results:
         scanner_tab(
             account_size,
             risk_percent,
@@ -2136,12 +2215,25 @@ def main():
             selected_benchmark,
             min_score_filter,
         )
-    with tab2:
-        ideas_tab()
-    with tab3:
-        journal_tab()
-    with tab4:
-        signals_tab()
+    else:
+        tab1, tab2, tab3, tab4 = st.tabs(["Scanner", "Ideas", "Journal", "Signals"])
+        with tab1:
+            scanner_tab(
+                account_size,
+                risk_percent,
+                top_n,
+                only_a_plus,
+                only_breakout,
+                only_market_ok,
+                selected_benchmark,
+                min_score_filter,
+            )
+        with tab2:
+            ideas_tab()
+        with tab3:
+            journal_tab()
+        with tab4:
+            signals_tab()
 
 
 if __name__ == "__main__":
