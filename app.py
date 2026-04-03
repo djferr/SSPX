@@ -7,6 +7,8 @@ import textwrap
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from datetime import date, datetime
+from zoneinfo import ZoneInfo
+
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import quote
 
@@ -34,6 +36,8 @@ A_PLUS_SCORE = 72
 WATCHLIST_FILE = "watchlist.json"
 JOURNAL_FILE = "trade_journal.csv"
 SNAPSHOT_DIR = "chart_snapshots"
+
+NY_TZ = ZoneInfo("America/New_York")
 
 INFO_TEXT = (
     "### Scanner Controls\n"
@@ -66,13 +70,95 @@ class ScanResult:
     trend_strength: float
     sector: str
     earnings_warning: str
-    entry: float
-    stop: float
-    target: float
-    risk_per_share: float
-    position_size_shares: int
     explanation: str
     notes: str
+
+
+@st.cache_data(show_spinner=False, ttl=300)
+def get_last_completed_session_date() -> str:
+    """Use recent SPY daily bars as the source of truth for the last completed market session.
+    This avoids extra calendar packages while still respecting most market holidays.
+    """
+    try:
+        df = yf.download(
+            "SPY",
+            period="10d",
+            interval="1d",
+            auto_adjust=True,
+            progress=False,
+            threads=False,
+        )
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+        if not df.empty:
+            idx = pd.to_datetime(df.index)
+            if len(idx) > 0:
+                return idx[-1].date().isoformat()
+    except Exception:
+        pass
+
+    now_ny = pd.Timestamp.now(tz=NY_TZ)
+    fallback = now_ny.date()
+    while fallback.weekday() >= 5:
+        fallback -= pd.Timedelta(days=1)
+    return str(fallback)
+
+
+def is_us_market_open_now() -> bool:
+    now_ny = pd.Timestamp.now(tz=NY_TZ)
+    if now_ny.weekday() >= 5:
+        return False
+
+    open_ts = now_ny.replace(hour=9, minute=30, second=0, microsecond=0)
+    close_ts = now_ny.replace(hour=16, minute=0, second=0, microsecond=0)
+    if not (open_ts <= now_ny <= close_ts):
+        return False
+
+    try:
+        last_session = pd.Timestamp(get_last_completed_session_date()).date()
+        today_ny = now_ny.date()
+        # On weekdays that are market holidays, the last completed session will be before today.
+        # In that case, force frozen mode even if the clock is inside regular market hours.
+        if last_session < today_ny:
+            return False
+    except Exception:
+        pass
+
+    return True
+
+
+def get_scan_market_context() -> Dict[str, str]:
+    now_ny = pd.Timestamp.now(tz=NY_TZ).floor("min")
+    last_session = get_last_completed_session_date()
+    is_live = is_us_market_open_now()
+
+    if is_live:
+        return {
+            "mode": "live",
+            "label": "Live Market Scan",
+            "as_of": last_session,
+            "cache_key": now_ny.strftime("live-%Y%m%d-%H%M"),
+            "timestamp": now_ny.strftime("%b %d, %Y %I:%M %p ET"),
+        }
+
+    return {
+        "mode": "frozen",
+        "label": "Last Completed Session Scan",
+        "as_of": last_session,
+        "cache_key": f"closed-{pd.Timestamp(last_session).strftime('%Y%m%d')}",
+        "timestamp": now_ny.strftime("%b %d, %Y %I:%M %p ET"),
+    }
+
+
+def get_scan_status_subtitle(scan_meta: Optional[Dict[str, str]] = None) -> str:
+    scan_meta = scan_meta or {}
+    label = str(scan_meta.get("label", "Scan"))
+    as_of = str(scan_meta.get("as_of", "")).strip()
+    if label == "Live Market Scan":
+        return f"Using live market data · Updated {scan_meta.get('timestamp', '')}"
+    if as_of:
+        return f"Frozen to the last completed session: {as_of}"
+    return "Using the most recent completed market session"
 
 
 class Storage:
@@ -211,24 +297,40 @@ class ScannerEngine:
 
     @staticmethod
     @st.cache_data(show_spinner=False, ttl=900)
-    def download_symbol(symbol: str) -> pd.DataFrame:
-        df = yf.download(
-            symbol,
+    def download_symbol(symbol: str, scan_cache_key: str = "", freeze_as_of: Optional[str] = None) -> pd.DataFrame:
+        download_kwargs = dict(
             period=LOOKBACK,
             interval="1d",
             auto_adjust=True,
             progress=False,
             threads=False,
         )
+        if freeze_as_of:
+            end_ts = pd.Timestamp(freeze_as_of) + pd.Timedelta(days=1)
+            download_kwargs["end"] = end_ts.strftime("%Y-%m-%d")
+        df = yf.download(symbol, **download_kwargs)
         return ScannerEngine.normalize_df(df)
 
     @staticmethod
-    def download_data(symbols: List[str], log_list: Optional[List[str]] = None) -> Dict[str, pd.DataFrame]:
+    def download_data(
+        symbols: List[str],
+        log_list: Optional[List[str]] = None,
+        scan_cache_key: str = "",
+        freeze_as_of: Optional[str] = None,
+    ) -> Dict[str, pd.DataFrame]:
         results: Dict[str, pd.DataFrame] = {}
         unique = list(dict.fromkeys(symbols))
 
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            future_map = {executor.submit(ScannerEngine.download_symbol, symbol): symbol for symbol in unique}
+            future_map = {
+                executor.submit(
+                    ScannerEngine.download_symbol,
+                    symbol,
+                    scan_cache_key,
+                    freeze_as_of,
+                ): symbol
+                for symbol in unique
+            }
             total = len(future_map)
             done = 0
 
@@ -353,30 +455,6 @@ class ScannerEngine:
         return False
 
     @staticmethod
-    def build_trade_plan(
-        close: float,
-        pivot: float,
-        ma21: float,
-        atr_pct: float,
-        account_size: float,
-        risk_percent: float,
-    ) -> Tuple[float, float, float, float, int]:
-        entry = round(max(close, pivot), 2)
-        stop_candidate_1 = pivot * 0.97
-        stop_candidate_2 = ma21 * 0.99
-        stop = round(min(stop_candidate_1, stop_candidate_2), 2)
-
-        if atr_pct > 0:
-            atr_stop = close * (1 - min(0.06, max(0.02, atr_pct / 100.0)))
-            stop = round(min(stop, atr_stop), 2)
-
-        risk_per_share = round(max(0.01, entry - stop), 2)
-        target = round(entry + (risk_per_share * 2.0), 2)
-        max_risk_dollars = max(1.0, account_size * (risk_percent / 100.0))
-        shares = int(max_risk_dollars // risk_per_share) if risk_per_share > 0 else 0
-        return entry, stop, target, risk_per_share, max(0, shares)
-
-    @staticmethod
     def build_explanation(
         symbol: str,
         score: int,
@@ -384,10 +462,6 @@ class ScannerEngine:
         market_ok: bool,
         reasons: List[str],
         cautions: List[str],
-        entry: float,
-        stop: float,
-        target: float,
-        shares: int,
     ) -> str:
         lines = [f"Why {symbol} is a candidate:"]
         lines.append(f"- Setup type: {setup_type}")
@@ -404,12 +478,6 @@ class ScannerEngine:
                 lines.append(f"- {caution}")
 
         lines.append("")
-        lines.append("Trade planning ideas:")
-        lines.append(f"- Suggested entry area: {entry:.2f}")
-        lines.append(f"- Suggested stop area: {stop:.2f}")
-        lines.append(f"- Suggested first target / sell zone: {target:.2f}")
-        lines.append(f"- Approx position size: {shares} shares")
-        lines.append("- Wait for clean price behavior near the pivot instead of forcing a trade.")
         lines.append("- Use this as a shortlist tool, not an automatic buy signal.")
         return "\n".join(lines)
 
@@ -419,8 +487,6 @@ class ScannerEngine:
         df: pd.DataFrame,
         bench_df: Optional[pd.DataFrame],
         market_ok: bool,
-        account_size: float,
-        risk_percent: float,
         sector: str,
         earnings_warning: str,
     ) -> Optional[ScanResult]:
@@ -579,15 +645,6 @@ class ScannerEngine:
         if "Earnings in" in earnings_warning:
             cautions.append("Earnings are coming soon, which adds event risk.")
 
-        entry, stop, target, risk_per_share, shares = ScannerEngine.build_trade_plan(
-            close=close,
-            pivot=pivot,
-            ma21=ma21,
-            atr_pct=0.0 if np.isnan(atrp) else atrp,
-            account_size=account_size,
-            risk_percent=risk_percent,
-        )
-
         explanation = ScannerEngine.build_explanation(
             symbol=symbol,
             score=score,
@@ -595,10 +652,6 @@ class ScannerEngine:
             market_ok=market_ok,
             reasons=reasons,
             cautions=cautions,
-            entry=entry,
-            stop=stop,
-            target=target,
-            shares=shares,
         )
 
         return ScanResult(
@@ -619,11 +672,6 @@ class ScannerEngine:
             trend_strength=0.0 if np.isnan(trend) else round(trend, 2),
             sector=sector,
             earnings_warning=earnings_warning,
-            entry=entry,
-            stop=stop,
-            target=target,
-            risk_per_share=risk_per_share,
-            position_size_shares=shares,
             explanation=explanation,
             notes=", ".join(notes),
         )
@@ -760,6 +808,11 @@ def inject_dark_theme():
 
         .stTabs [data-baseweb="tab-list"] {
             gap: 0.45rem;
+        }
+
+        .stRadio > div {
+            gap: 0.75rem;
+            margin-bottom: 0.6rem;
         }
 
         .stTabs [data-baseweb="tab"] {
@@ -997,6 +1050,8 @@ def ensure_state() -> None:
         st.session_state.selected_symbol = None
     if "selected_benchmark" not in st.session_state:
         st.session_state.selected_benchmark = "Auto"
+    if "scan_meta" not in st.session_state:
+        st.session_state.scan_meta = get_scan_market_context()
     if "min_score_filter" not in st.session_state:
         st.session_state.min_score_filter = 0
 
@@ -1019,10 +1074,6 @@ def ensure_results_schema(df: pd.DataFrame) -> pd.DataFrame:
         "sector": "Unknown",
         "setup_type": "Mixed Setup",
         "close": 0.0,
-        "entry": 0.0,
-        "stop": 0.0,
-        "target": 0.0,
-        "position_size_shares": 0,
         "news_headline": "No recent headline found",
         "catalyst_tags": "",
         "why_pick": "",
@@ -1082,24 +1133,135 @@ def make_sparkline_data_uri(price_df: Optional[pd.DataFrame]) -> str:
     return "data:image/svg+xml;utf8," + quote(svg)
 
 
+
+
+@st.cache_data(show_spinner=False, ttl=900)
+def get_news_data(symbol: str) -> Tuple[int, str, str, str]:
+    bullish = [
+        "upgrade", "beats", "beat", "strong", "growth", "partnership",
+        "record", "launch", "raised", "raise", "expands", "expansion",
+        "buyback", "approval", "ai", "contract"
+    ]
+    bearish = [
+        "downgrade", "miss", "misses", "lawsuit", "decline", "cut",
+        "warning", "probe", "investigation", "delay", "weak", "falls",
+        "fall", "recall", "offering"
+    ]
+    tag_map = {
+        "earn": "Earnings",
+        "upgrade": "Upgrade",
+        "downgrade": "Downgrade",
+        "partnership": "Partnership",
+        "contract": "Contract",
+        "ai": "AI",
+        "buyback": "Buyback",
+        "approval": "Approval",
+        "lawsuit": "Lawsuit Risk",
+        "investigation": "Investigation",
+    }
+
+    try:
+        ticker = yf.Ticker(symbol)
+        items = ticker.news or []
+    except Exception:
+        return 0, "Neutral", "No recent headline found", ""
+
+    score = 0
+    headline = "No recent headline found"
+    tags: List[str] = []
+
+    for item in items[:5]:
+        title = str(item.get("title", "")).strip()
+        if not title:
+            continue
+        if headline == "No recent headline found":
+            headline = title
+
+        lower = title.lower()
+        if any(word in lower for word in bullish):
+            score += 2
+        if any(word in lower for word in bearish):
+            score -= 2
+
+        for needle, label in tag_map.items():
+            if needle in lower and label not in tags:
+                tags.append(label)
+
+    if score >= 4:
+        sentiment = "Bullish"
+    elif score <= -4:
+        sentiment = "Bearish"
+    else:
+        sentiment = "Neutral"
+
+    return score, sentiment, headline, ", ".join(tags[:4])
+
+
+def calculate_confidence(row: dict) -> Tuple[int, str]:
+    confidence = int(row.get("score", 0))
+
+    if bool(row.get("breakout_ready", False)):
+        confidence += 8
+    if float(row.get("volume_ratio_today", 0) or 0) >= 1.5:
+        confidence += 6
+    if float(row.get("rs_vs_benchmark_3m", 0) or 0) > 10:
+        confidence += 6
+    if float(row.get("tight_close_range_10d", 999) or 999) < 4:
+        confidence += 4
+
+    if "Earnings in" in str(row.get("earnings_warning", "")):
+        confidence -= 10
+    if not bool(row.get("market_ok", False)):
+        confidence -= 6
+    if float(row.get("atr_pct", 0) or 0) > 7:
+        confidence -= 4
+    if str(row.get("news_sentiment", "Neutral")) == "Bullish":
+        confidence += 4
+    elif str(row.get("news_sentiment", "Neutral")) == "Bearish":
+        confidence -= 6
+
+    confidence = max(0, min(100, int(confidence)))
+
+    if confidence >= 85:
+        label = "High"
+    elif confidence >= 70:
+        label = "Medium"
+    else:
+        label = "Low"
+
+    return confidence, label
+
+
 def run_scan_logic(
     symbols: List[str],
-    account_size: float,
-    risk_percent: float,
     selected_benchmark: str = "Auto",
 ) -> Tuple[pd.DataFrame, Dict[str, pd.DataFrame], List[str], List[str]]:
     logs: List[str] = []
     alerts: List[str] = []
 
+    market_context = get_scan_market_context()
+    st.session_state["scan_meta"] = market_context
+    logs.append(f"{market_context["label"]} | As of {market_context["as_of"]}")
+
     universe = list(dict.fromkeys([s.strip().upper() for s in symbols if s.strip()]))
-    price_data = ScannerEngine.download_data(universe, log_list=logs)
+    freeze_as_of = market_context["as_of"] if market_context["mode"] != "live" else None
+    price_data = ScannerEngine.download_data(
+        universe,
+        log_list=logs,
+        scan_cache_key=market_context["cache_key"],
+        freeze_as_of=freeze_as_of,
+    )
 
     bench_df = None
     bench_used = None
 
     if selected_benchmark != "Auto":
         logs.append(f"Using chosen benchmark: {selected_benchmark}")
-        bench_data = ScannerEngine.download_data([selected_benchmark])
+        bench_data = ScannerEngine.download_data(
+            [selected_benchmark],
+            scan_cache_key=market_context["cache_key"],
+            freeze_as_of=freeze_as_of,
+        )
         candidate = bench_data.get(selected_benchmark)
         if candidate is not None and not candidate.empty and len(candidate) >= 130:
             bench_df = candidate
@@ -1109,7 +1271,11 @@ def run_scan_logic(
     if bench_df is None:
         for bench in BENCHMARKS:
             logs.append(f"Trying benchmark: {bench}")
-            bench_data = ScannerEngine.download_data([bench])
+            bench_data = ScannerEngine.download_data(
+                [bench],
+                scan_cache_key=market_context["cache_key"],
+                freeze_as_of=freeze_as_of,
+            )
             candidate = bench_data.get(bench)
             if candidate is not None and not candidate.empty and len(candidate) >= 130:
                 bench_df = candidate
@@ -1136,8 +1302,6 @@ def run_scan_logic(
                 df=df,
                 bench_df=bench_df,
                 market_ok=market_ok,
-                account_size=account_size,
-                risk_percent=risk_percent,
                 sector="Unknown",
                 earnings_warning="Unknown",
             )
@@ -1164,6 +1328,33 @@ def run_scan_logic(
                 if "Earnings are coming soon" not in current_expl:
                     current_expl += f"\n\nThings to watch:\n- {earnings_warning}, which adds event risk."
                     out.loc[out["symbol"] == sym, "explanation"] = current_expl
+
+        news_scores: List[int] = []
+        news_sentiments: List[str] = []
+        news_headlines: List[str] = []
+        catalyst_tags: List[str] = []
+
+        for _, row in out.iterrows():
+            ns, sent, head, tags = get_news_data(str(row["symbol"]))
+            news_scores.append(ns)
+            news_sentiments.append(sent)
+            news_headlines.append(head)
+            catalyst_tags.append(tags)
+
+        out["news_score"] = news_scores
+        out["news_sentiment"] = news_sentiments
+        out["news_headline"] = news_headlines
+        out["catalyst_tags"] = catalyst_tags
+
+        confidence_scores: List[int] = []
+        confidence_labels: List[str] = []
+        for _, row in out.iterrows():
+            cs, cl = calculate_confidence(row.to_dict())
+            confidence_scores.append(cs)
+            confidence_labels.append(cl)
+
+        out["confidence_score"] = confidence_scores
+        out["confidence_label"] = confidence_labels
 
         alert_set = set()
         for _, row in out.head(20).iterrows():
@@ -1252,6 +1443,25 @@ def save_snapshot(symbol: str, df: pd.DataFrame, row: dict) -> str:
     return path
 
 
+
+
+def render_clean_header():
+    st.markdown(
+        f"""
+        <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:18px;flex-wrap:wrap;margin-top:8px;margin-bottom:18px;">
+            <div>
+                <div style="font-size:2.45rem;font-weight:900;line-height:1.05;color:#f8fafc;">{APP_TITLE}</div>
+                <div style="font-size:1.05rem;color:#9fb4d9;margin-top:10px;">{APP_TAGLINE}</div>
+            </div>
+            <div style="display:flex;gap:10px;align-items:center;">
+                <span class="sspx-chip">👤 Profile</span>
+                <span class="sspx-chip">⚙️ Settings</span>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
 def render_app_header():
     st.markdown(
         f"""
@@ -1295,13 +1505,172 @@ def render_market_status_bar(results_df: pd.DataFrame):
             market_label = "Market Status: Caution"
             market_kind = "yellow"
 
-    c1, c2, c3 = st.columns([1, 1, 1.3])
+    scan_meta = st.session_state.get("scan_meta", {})
+
+    c1, c2, c3, c4 = st.columns([1, 1, 1.3, 1.5])
     with c1:
         st.markdown(badge_html(market_label, market_kind), unsafe_allow_html=True)
     with c2:
         st.markdown(badge_html("Universe: S&P 500", "blue"), unsafe_allow_html=True)
     with c3:
         st.markdown(badge_html("Mode: Pro Momentum Scanner", "purple"), unsafe_allow_html=True)
+    with c4:
+        scan_kind = "green" if scan_meta.get("mode") == "live" else "blue"
+        st.markdown(badge_html(str(scan_meta.get("label", "Scan")), scan_kind), unsafe_allow_html=True)
+        if scan_meta.get("timestamp"):
+            st.caption(get_scan_status_subtitle(scan_meta))
+
+
+
+def display_setup_label(setup_type: str) -> str:
+    setup = str(setup_type or "").strip()
+    if setup == "Mixed Setup":
+        return "Developing Setup"
+    return setup
+
+
+def build_pick_summary_line(row: dict) -> str:
+    bits = []
+
+    if row.get("rs_vs_benchmark_3m", 0) >= 15:
+        bits.append("strong relative strength")
+    elif row.get("rs_vs_benchmark_3m", 0) >= 8:
+        bits.append("good relative strength")
+
+    conf = str(row.get("confidence_label", ""))
+    if conf == "High":
+        bits.append("high confidence")
+    elif conf == "Medium":
+        bits.append("medium confidence")
+
+    if row.get("breakout_ready", False):
+        bits.append("near breakout zone")
+
+    news = str(row.get("news_sentiment", "Neutral"))
+    if news == "Bullish":
+        bits.append("bullish news backdrop")
+    elif news == "Bearish":
+        bits.append("headline risk")
+
+    earnings = str(row.get("earnings_warning", ""))
+    if "Earnings in" in earnings:
+        bits.append("earnings catalyst")
+
+    if not bits:
+        bits = ["clean technical structure"]
+
+    return " + ".join(bits[:4]).capitalize()
+
+
+def confidence_value_html(conf_label: str) -> str:
+    conf = str(conf_label or "Low")
+    if conf == "High":
+        color = "#86efac"
+    elif conf == "Medium":
+        color = "#93c5fd"
+    else:
+        color = "#d1d5db"
+    return f"<span style='font-weight:800;color:{color};'>{conf}</span>"
+
+
+
+def render_saved_watchlist_bar():
+    watchlist = sorted(list(dict.fromkeys([str(s).upper() for s in st.session_state.get("watchlist", [])])))
+
+    st.markdown("#### Watchlist")
+    if not watchlist:
+        st.markdown(
+            """
+            <div class="sspx-panel" style="margin-bottom:14px;">
+                <div style="font-size:0.92rem;color:#9ca3af;margin-bottom:10px;">Your saved names for quick follow-up</div>
+                <div style="color:#cbd5e1;">No watchlist names yet. Open any pick and press the save button.</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        return
+
+    chips = "".join(
+        f"<span class='sspx-chip' style='margin-bottom:10px;'>{sym}</span>"
+        for sym in watchlist[:24]
+    )
+    st.markdown(
+        f"""
+        <div class="sspx-panel" style="margin-bottom:14px;">
+            <div style="font-size:0.92rem;color:#9ca3af;margin-bottom:10px;">Your saved names for quick follow-up</div>
+            <div>{chips}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def build_alert_candidates(results_df: pd.DataFrame) -> List[str]:
+    results_df = ensure_results_schema(results_df)
+    if results_df.empty:
+        return ["No notable alerts from current results."]
+
+    alerts = []
+    ranked = results_df.sort_values(
+        by=["score", "confidence_score", "rs_vs_benchmark_3m", "volume_ratio_today"],
+        ascending=[False, False, False, False],
+    ).head(12)
+
+    for _, row in ranked.iterrows():
+        symbol = row.get("symbol", "")
+        conf = str(row.get("confidence_label", ""))
+        news = str(row.get("news_sentiment", "Neutral"))
+        vol = float(row.get("volume_ratio_today", 0) or 0)
+
+        if row.get("breakout_ready", False) and conf == "High" and news == "Bullish":
+            alerts.append(f"{symbol}: breakout-ready + high confidence + bullish news")
+        elif row.get("breakout_ready", False) and vol >= 1.5:
+            alerts.append(f"{symbol}: breakout-ready + volume confirmation")
+        elif conf == "High" and float(row.get('rs_vs_benchmark_3m', 0) or 0) >= 15:
+            alerts.append(f"{symbol}: high-confidence relative strength leader")
+        elif "Earnings in" in str(row.get("earnings_warning", "")):
+            alerts.append(f"{symbol}: {row.get('earnings_warning')}")
+
+    return alerts[:8] if alerts else ["No notable alerts from current results."]
+
+
+def render_live_alerts_panel(results_df: pd.DataFrame):
+    alert_items = build_alert_candidates(results_df)
+
+    st.markdown("#### Live Alerts")
+    rows = "".join(
+        f"<div style='padding:10px 0;border-bottom:1px solid rgba(255,255,255,0.06);color:#e5e7eb;'>{item}</div>"
+        for item in alert_items
+    )
+    st.markdown(
+        f"""
+        <div class="sspx-panel" style="margin-bottom:14px;">
+            <div style="font-size:0.92rem;color:#9ca3af;margin-bottom:4px;">Best current signal events</div>
+            {rows}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_watchlist_manager():
+    watchlist = sorted(list(dict.fromkeys([str(s).upper() for s in st.session_state.get("watchlist", [])])))
+    if not watchlist:
+        return
+
+    with st.expander("Manage watchlist"):
+        remove_symbol = st.selectbox(
+            "Remove a watchlist ticker",
+            options=[""] + watchlist,
+            index=0,
+            key="watchlist_remove_select",
+        )
+        if st.button("Remove selected", use_container_width=True, key="watchlist_remove_btn"):
+            if remove_symbol:
+                st.session_state.watchlist = [s for s in st.session_state.watchlist if str(s).upper() != remove_symbol]
+                Storage.save_watchlist(st.session_state.watchlist)
+                st.success(f"Removed {remove_symbol}")
+                st.rerun()
 
 
 def render_scan_kpis(results_df: pd.DataFrame):
@@ -1323,6 +1692,46 @@ def render_scan_kpis(results_df: pd.DataFrame):
     with c4:
         st.markdown(info_tile("A+ setups", str(a_plus_count), f"Score {A_PLUS_SCORE}+"), unsafe_allow_html=True)
 
+def render_market_context(results_df: pd.DataFrame):
+    results_df = ensure_results_schema(results_df)
+    if results_df.empty:
+        return
+
+    market_ok = bool(results_df["market_ok"].mode().iloc[0]) if "market_ok" in results_df.columns else False
+    breakout_count = int(results_df["breakout_ready"].sum()) if "breakout_ready" in results_df.columns else 0
+    high_conf = int((results_df["confidence_label"] == "High").sum()) if "confidence_label" in results_df.columns else 0
+    vol_conf = int(((results_df["breakout_ready"] == True) & (results_df["volume_ratio_today"] >= 1.5)).sum()) if {"breakout_ready","volume_ratio_today"}.issubset(results_df.columns) else 0
+
+    market_line = "Market is healthy — trend setups prioritized." if market_ok else "Market is mixed — signals deserve more selectivity."
+    line2 = f"{breakout_count} breakout-ready name(s) detected."
+    line3 = f"{high_conf} high-confidence setup(s) in the current results."
+    line4 = f"{vol_conf} name(s) showing breakout + volume confirmation."
+
+
+def render_alerts_panel(results_df: pd.DataFrame, alerts: List[str]):
+    results_df = ensure_results_schema(results_df)
+    st.markdown("#### Signal Highlights")
+
+    derived = build_alert_candidates(results_df)
+    merged = []
+    for item in derived + list(alerts or []):
+        if item not in merged:
+            merged.append(item)
+
+    items = merged[:8] if merged else ["No notable alerts from current results."]
+    rows = "".join(
+        f"<div style='padding:10px 0;border-bottom:1px solid rgba(255,255,255,0.06);color:#e5e7eb;'>{item}</div>"
+        for item in items
+    )
+    st.markdown(
+        f"""
+        <div class="sspx-panel" style="margin-bottom:14px;">
+            <div style="font-size:0.92rem;color:#9ca3af;margin-bottom:4px;">Highest priority signal events from the current scan</div>
+            {rows}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def get_pick_badges(row: dict) -> List[str]:
@@ -1453,17 +1862,13 @@ def render_pick_detail_panel(row: dict, price_data: Dict[str, pd.DataFrame], ran
         ">
             <div style="font-size:0.82rem;color:#93c5fd;margin-bottom:8px;">{rank_label} details</div>
             <div style="display:grid;grid-template-columns:repeat(2,minmax(120px,1fr));gap:10px 18px;color:#d1d5db;font-size:0.95rem;line-height:1.55;">
-                <div><b>Entry:</b> {row.get('entry')}</div>
-                <div><b>Stop:</b> {row.get('stop')}</div>
-                <div><b>Target:</b> {row.get('target')}</div>
-                <div><b>Position Size:</b> {row.get('position_size_shares')} shares</div>
                 <div><b>Sector:</b> {row.get('sector')}</div>
+                <div><b>Setup:</b> {row.get('setup_type')}</div>
                 <div><b>Confidence:</b> {row.get('confidence_score')} ({row.get('confidence_label')})</div>
                 <div><b>News:</b> {row.get('news_sentiment')} ({row.get('news_score')})</div>
                 <div><b>3M RS:</b> {row.get('rs_vs_benchmark_3m')}%</div>
                 <div><b>Volume Ratio:</b> {row.get('volume_ratio_today')}x</div>
-                <div style="grid-column:1 / -1;"><b>Catalysts:</b> {row.get('catalyst_tags') or 'None'}</div>
-                <div style="grid-column:1 / -1;"><b>Headline:</b> {row.get('news_headline') or 'No recent headline found'}</div>
+                <div style="grid-column:1 / -1;"><b>Headline:</b> {row.get('news_headline') or 'No major news catalysts'}</div>
             </div>
             <div style="margin-top:16px;">
                 <div style="font-size:0.85rem;color:#9ca3af;margin-bottom:8px;">Why this pick</div>
@@ -1476,38 +1881,35 @@ def render_pick_detail_panel(row: dict, price_data: Dict[str, pd.DataFrame], ran
         unsafe_allow_html=True,
     )
 
+    already_saved = symbol in [str(s).upper() for s in st.session_state.get("watchlist", [])]
     action_cols = st.columns(3)
     with action_cols[0]:
-        if st.button(f"⭐ Save {symbol} to Watchlist", key=f"ideas_{rank_label}_{symbol}", use_container_width=True):
+        save_label = f"Saved: {symbol}" if already_saved else f"⭐ Save {symbol}"
+        if st.button(save_label, key=f"ideas_{rank_label}_{symbol}", use_container_width=True, disabled=already_saved):
             st.session_state.watchlist.append(symbol)
             st.session_state.watchlist = sorted(list(dict.fromkeys([s.upper() for s in st.session_state.watchlist])))
             Storage.save_watchlist(st.session_state.watchlist)
             st.success(f"Added {symbol}")
+            st.rerun()
 
     with action_cols[1]:
-        if st.button(f"Add {symbol} to Journal", key=f"journal_{rank_label}_{symbol}", use_container_width=True):
-            journal_row = {
-                "date": datetime.now().strftime("%Y-%m-%d"),
-                "symbol": row.get("symbol", ""),
-                "entry": row.get("entry", ""),
-                "stop": row.get("stop", ""),
-                "target": row.get("target", ""),
-                "shares": row.get("position_size_shares", ""),
-                "setup_type": row.get("setup_type", ""),
-                "score": row.get("score", ""),
-                "status": "planned",
-                "notes": f"{row.get('notes', '')} | news={row.get('news_sentiment', 'Neutral')} ({row.get('news_score', 0)})",
-            }
-            Storage.add_journal_row(journal_row)
-            st.success(f"Added {symbol} to journal")
-
-    with action_cols[2]:
         if price_df is not None and not price_df.empty:
             if st.button(f"Save {symbol} Snapshot", key=f"snap_{rank_label}_{symbol}", use_container_width=True):
                 path = save_snapshot(symbol, price_df, row)
                 st.success(f"Saved to {path}")
         else:
             st.button("No Chart Data", key=f"nodata_{rank_label}_{symbol}", use_container_width=True, disabled=True)
+
+    with action_cols[2]:
+        alert_text = build_alert_candidates(pd.DataFrame([row]))
+        st.markdown(
+            f"""
+            <div style="padding:10px 12px;border:1px solid rgba(255,255,255,0.08);border-radius:12px;background:#0f172a;color:#cbd5e1;font-size:0.88rem;min-height:42px;display:flex;align-items:center;">
+                {alert_text[0]}
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
     if price_df is not None and not price_df.empty:
         fig = build_chart(symbol, price_df, row)
@@ -1532,28 +1934,66 @@ def render_pick_detail_panel(row: dict, price_data: Dict[str, pd.DataFrame], ran
     )
 
 
+def compute_backtested_strategy_overlay(row: dict, price_data: Dict[str, pd.DataFrame]) -> Optional[dict]:
+    symbol = str(row.get("symbol", "")).upper().strip()
+    if not symbol:
+        return None
+
+    price_df = price_data.get(symbol)
+    if price_df is None or price_df.empty or "Close" not in price_df.columns:
+        return None
+
+    close = float(row.get("close", price_df["Close"].iloc[-1]))
+    pivot = float(row.get("pivot", price_df["High"].tail(30).max()))
+
+    ma21_series = price_df["Close"].rolling(21).mean()
+    ma21 = float(ma21_series.iloc[-1]) if len(ma21_series.dropna()) else close
+
+    atr_pct_value = ScannerEngine.atr_pct(price_df)
+
+    entry = round(close, 2)
+    stop_candidate_1 = pivot * 0.98
+    stop_candidate_2 = ma21 * 0.99
+    stop = round(min(stop_candidate_1, stop_candidate_2), 2)
+
+    if not np.isnan(atr_pct_value) and atr_pct_value > 0:
+        atr_stop = close * (1 - min(0.06, max(0.02, atr_pct_value / 100.0)))
+        stop = round(min(stop, atr_stop), 2)
+
+    risk_per_share = round(max(0.01, entry - stop), 2)
+    target = round(entry + (risk_per_share * 1), 2)
+
+    return {
+        "entry": entry,
+        "stop": stop,
+        "target": target,
+        "risk_per_share": risk_per_share,
+        "pivot": round(pivot, 2),
+        "ma21": round(ma21, 2),
+        "atr_pct": 0.0 if np.isnan(atr_pct_value) else round(float(atr_pct_value), 2),
+    }
+
 
 def render_feed_pick_card(row: dict, price_data: Dict[str, pd.DataFrame], rank_number: int, hero: bool = False):
     symbol = str(row.get("symbol", ""))
     spark_uri = make_sparkline_data_uri(price_data.get(symbol))
     badges = get_pick_badges(row)
-    badges.append(badge_html("Top Pick", "purple") if hero else badge_html(f"Pick #{rank_number}", "purple"))
 
-    title = "Top Pick of the Day" if hero else f"Pick #{rank_number}"
-    confidence_label = str(row.get("confidence_label", ""))
-    if confidence_label == "High":
-        confidence_text = "High confidence"
-    elif confidence_label == "Medium":
-        confidence_text = "Medium confidence"
-    else:
-        confidence_text = "Tracking"
+    news_sent = str(row.get("news_sentiment", "Neutral"))
+    if news_sent == "Bullish":
+        badges.append(badge_html("Bullish News", "green"))
+    elif news_sent == "Bearish":
+        badges.append(badge_html("Bearish News", "red"))
 
-    setup_type = str(row.get("setup_type", "Mixed Setup"))
+    title = "Featured Pick" if hero else f"#{rank_number}"
+    confidence_text = str(row.get("confidence_label", "Low"))
+    setup_type = display_setup_label(str(row.get("setup_type", "Mixed Setup")))
     score_value = row.get("score", 0)
     target_value = row.get("target", 0)
     close_value = row.get("close", 0)
     rs_value = row.get("rs_vs_benchmark_3m", 0)
-
+    summary_line = build_pick_summary_line(row)
+    sparkline_uri = make_sparkline_data_uri(price_data.get(symbol))
     st.markdown(
         f"""
         <div style="
@@ -1565,74 +2005,58 @@ def render_feed_pick_card(row: dict, price_data: Dict[str, pd.DataFrame], rank_n
             box-shadow: {'0 22px 60px rgba(0,0,0,0.26)' if hero else '0 14px 34px rgba(0,0,0,0.20)'};
         ">
             <div style="font-size:0.86rem;color:#93c5fd;font-weight:800;margin-bottom:8px;letter-spacing:0.03em;">{title}</div>
-            <div style="font-size:{'2.5rem' if hero else '1.6rem'};font-weight:950;color:#f8fafc;margin-bottom:12px;letter-spacing:-0.03em;line-height:1;">
+            <div style="font-size:{'2.5rem' if hero else '1.6rem'};font-weight:950;color:#f8fafc;margin-bottom:8px;letter-spacing:-0.03em;line-height:1;">
                 {symbol}
             </div>
+            <div style="font-size:0.96rem;color:#cbd5e1;margin-bottom:12px;">{summary_line}</div>
             <div style="margin-bottom:12px;">{''.join(badges)}</div>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-    info_cols = st.columns([1.15, 1.15, 1.15, 1.1] if hero else [1, 1, 1, 1])
-    with info_cols[0]:
-        st.markdown(info_tile("Score", f"{score_value}"), unsafe_allow_html=True)
-    with info_cols[1]:
-        st.markdown(info_tile("Setup", f"{setup_type}"), unsafe_allow_html=True)
-    with info_cols[2]:
-        st.markdown(info_tile("Target", f"{target_value}"), unsafe_allow_html=True)
-    with info_cols[3]:
-        st.markdown(info_tile("Confidence", confidence_text), unsafe_allow_html=True)
-
-    meta_left, meta_right = st.columns([1.35, 0.65])
-    with meta_left:
-        st.markdown(
-            f"""
-            <div class="sspx-panel" style="margin-top:4px;">
-                <div style="display:flex;gap:18px;flex-wrap:wrap;color:#cbd5e1;font-size:0.95rem;">
-                    <div><span style="color:#94a3b8;">Close</span> <span style="font-weight:800;color:#f8fafc;">{close_value}</span></div>
-                    <div><span style="color:#94a3b8;">3M RS</span> <span style="font-weight:800;color:#f8fafc;">{rs_value}%</span></div>
-                    <div><span style="color:#94a3b8;">Confidence</span> <span style="font-weight:800;color:#f8fafc;">{confidence_text}</span></div>
-                </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-    with meta_right:
-        st.markdown('<div style="font-size:0.8rem;color:#9ca3af;margin:6px 0 8px 0;">' + ('30-day momentum' if hero else '30-day sparkline') + '</div>', unsafe_allow_html=True)
-        if spark_uri:
-            st.markdown(
-                f"""
-                <div style="background:#09111f;border:1px solid rgba(255,255,255,0.08);border-radius:18px;padding:12px;">
-                    <img src="{spark_uri}" style="width:100%;height:{96 if hero else 76}px;display:block;" />
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-        else:
-            st.markdown('<div class="sspx-panel">No sparkline</div>', unsafe_allow_html=True)
-
-    quick_label = "Tap for quick view" if hero else f"Tap for Pick #{rank_number} quick view"
+    quick_label = "Tap for more info" if hero else f"Tap for more info"
     detail_key = f"show_breakdown_{symbol}_{rank_number}_{'hero' if hero else 'feed'}"
-    with st.expander(quick_label, expanded=hero):
+    with st.expander(quick_label, expanded=False):
         q1, q2 = st.columns(2)
         with q1:
             st.markdown(metric_card("Score", row.get("score")), unsafe_allow_html=True)
             st.markdown(metric_card("Confidence", row.get("confidence_label") or "Tracking"), unsafe_allow_html=True)
             st.markdown(metric_card("Close", row.get("close")), unsafe_allow_html=True)
         with q2:
-            st.markdown(metric_card("Setup", row.get("setup_type")), unsafe_allow_html=True)
-            st.markdown(metric_card("Target", row.get("target")), unsafe_allow_html=True)
+            st.markdown(metric_card("Setup", setup_type), unsafe_allow_html=True)
             st.markdown(metric_card("3M RS", f"{row.get('rs_vs_benchmark_3m')}%"), unsafe_allow_html=True)
+            st.markdown(metric_card("Volume", f"{row.get('volume_ratio_today')}x"), unsafe_allow_html=True)
 
-        st.markdown(
-            f"""
-            <div class="sspx-panel" style="margin-top:10px;">
-                <div><b>Tags:</b> {row.get('catalyst_tags') or 'None'}</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+        with st.expander("Backtested Strategy Overlay", expanded=False):
+            overlay = compute_backtested_strategy_overlay(row, price_data)
+            if overlay is None:
+                st.info("Overlay unavailable for this pick right now.")
+            else:
+                o1, o2, o3, o4 = st.columns(4)
+                with o1:
+                    st.markdown(metric_card("Entry", overlay["entry"]), unsafe_allow_html=True)
+                with o2:
+                    st.markdown(metric_card("Stop", overlay["stop"]), unsafe_allow_html=True)
+                with o3:
+                    st.markdown(metric_card("Target 1R", overlay["target"]), unsafe_allow_html=True)
+                with o4:
+                    st.markdown(metric_card("Risk/Share", overlay["risk_per_share"]), unsafe_allow_html=True)
+
+                st.markdown(
+                    f"""
+                    <div class="sspx-panel" style="margin-top:12px;padding:14px 16px;">
+                        <div style="font-size:0.9rem;color:#93c5fd;font-weight:800;margin-bottom:6px;">Backtested strategy overlay</div>
+                        <div style="font-size:0.95rem;color:#d1d5db;line-height:1.6;">
+                            This uses the backtest's 1R framework for <b>{symbol}</b>: entry near the current close,
+                            stop under pivot / 21-day support / ATR floor, and a target equal to 1× risk.
+                            Pivot: <b>{overlay['pivot']}</b> &nbsp;•&nbsp; 21-day average: <b>{overlay['ma21']}</b>
+                            &nbsp;•&nbsp; ATR %: <b>{overlay['atr_pct']}</b>
+                        </div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
 
         btn_label = "Show full breakdown" if hero else f"Show Pick #{rank_number} full breakdown"
         detail_state_key = f"{detail_key}_open"
@@ -1642,11 +2066,11 @@ def render_feed_pick_card(row: dict, price_data: Dict[str, pd.DataFrame], rank_n
         if st.session_state.get(detail_state_key, False):
             render_pick_detail_panel(row, price_data, "Top Pick" if hero else f"Pick #{rank_number}")
 
+def render_top_pick_hero(results_df: pd.DataFrame, price_data: Dict[str, pd.DataFrame]) -> Optional[str]:
 
-def render_top_pick_hero(results_df: pd.DataFrame, price_data: Dict[str, pd.DataFrame]):
     results_df = ensure_results_schema(results_df)
     if results_df.empty:
-        return
+        return None
 
     hero_df = results_df.sort_values(
         by=["score", "technical_score", "breakout_ready", "rs_vs_benchmark_3m", "volume_ratio_today"],
@@ -1654,13 +2078,40 @@ def render_top_pick_hero(results_df: pd.DataFrame, price_data: Dict[str, pd.Data
     ).head(1)
 
     if hero_df.empty:
-        return
+        return None
 
     row = hero_df.iloc[0].to_dict()
     render_feed_pick_card(row, price_data, rank_number=1, hero=True)
+    return str(row.get("symbol", "")).upper().strip() or None
 
 
-def render_ranked_feed(results_df: pd.DataFrame, price_data: Dict[str, pd.DataFrame], top_n: int = 10):
+
+
+def render_pick_divider():
+    st.markdown(
+        """
+        <div style="
+            height: 1px;
+            margin: 18px 0 22px 0;
+            background: linear-gradient(
+                90deg,
+                rgba(255,255,255,0.00) 0%,
+                rgba(148,163,184,0.18) 12%,
+                rgba(148,163,184,0.28) 50%,
+                rgba(148,163,184,0.18) 88%,
+                rgba(255,255,255,0.00) 100%
+            );
+        "></div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+def render_ranked_feed(
+    results_df: pd.DataFrame,
+    price_data: Dict[str, pd.DataFrame],
+    top_n: int = 10,
+    exclude_symbol: Optional[str] = None,
+):
     results_df = ensure_results_schema(results_df)
     if results_df.empty:
         return
@@ -1670,10 +2121,17 @@ def render_ranked_feed(results_df: pd.DataFrame, price_data: Dict[str, pd.DataFr
     ranked = results_df.sort_values(
         by=["score", "technical_score", "rs_vs_benchmark_3m", "volume_ratio_today"],
         ascending=[False, False, False, False],
-    ).head(top_n).reset_index(drop=True)
+    ).reset_index(drop=True)
+
+    if exclude_symbol:
+        ranked = ranked[ranked["symbol"].astype(str).str.upper() != str(exclude_symbol).upper()]
+
+    ranked = ranked.head(top_n).reset_index(drop=True)
 
     for idx, row in ranked.iterrows():
         render_feed_pick_card(row.to_dict(), price_data, rank_number=idx + 1, hero=False)
+        if idx < len(ranked) - 1:
+            render_pick_divider()
 
 def render_stock_summary_card(row: dict):
     badges = []
@@ -1696,11 +2154,11 @@ def render_stock_summary_card(row: dict):
             <div><b>Setup</b><br>{row['setup_type']}</div>
             <div><b>Sector</b><br>{row['sector']}</div>
             <div><b>Close</b><br>{row['close']}</div>
-            <div><b>Entry</b><br>{row['entry']}</div>
-            <div><b>Stop</b><br>{row['stop']}</div>
-            <div><b>Target</b><br>{row.get('target', '')}</div>
-            <div><b>Risk / Share</b><br>{row['risk_per_share']}</div>
-            <div><b>Position Size</b><br>{row['position_size_shares']}</div>
+            <div><b>3M RS</b><br>{row['rs_vs_benchmark_3m']}%</div>
+            <div><b>6M RS</b><br>{row['rs_vs_benchmark_6m']}%</div>
+            <div><b>Volume Ratio</b><br>{row['volume_ratio_today']}x</div>
+            <div><b>ATR %</b><br>{row['atr_pct']}</div>
+            <div><b>Trend Strength</b><br>{row['trend_strength']}</div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -1740,13 +2198,16 @@ def render_stock_details_cards(row: dict):
 
     row3 = st.columns(4)
     with row3[0]:
-        st.markdown(metric_card("Entry", row.get("entry", "")), unsafe_allow_html=True)
+        atr_pct = float(row.get("atr_pct", 0))
+        st.markdown(metric_card("ATR %", f"{atr_pct}%", atr_pct <= 5), unsafe_allow_html=True)
     with row3[1]:
-        st.markdown(metric_card("Stop", row.get("stop", "")), unsafe_allow_html=True)
+        tight = float(row.get("tight_close_range_10d", 0))
+        st.markdown(metric_card("10D Tightness", f"{tight}%", tight <= 4.5), unsafe_allow_html=True)
     with row3[2]:
-        st.markdown(metric_card("Risk / Share", row.get("risk_per_share", "")), unsafe_allow_html=True)
+        trend_strength = float(row.get("trend_strength", 0))
+        st.markdown(metric_card("Trend Strength", f"{trend_strength}", trend_strength >= 8), unsafe_allow_html=True)
     with row3[3]:
-        st.markdown(metric_card("Position Size", row.get("position_size_shares", "")), unsafe_allow_html=True)
+        st.markdown(metric_card("Sector", row.get("sector", "Unknown")), unsafe_allow_html=True)
 
     row4 = st.columns(4)
     with row4[0]:
@@ -1887,60 +2348,7 @@ def render_results_table(results_df: pd.DataFrame):
     return response
 
 
-def sidebar_controls():
-    with st.sidebar:
-        st.title(APP_TITLE)
-        st.caption("Professional Edition")
-
-        account_size = st.number_input("Account Size", min_value=1000.0, value=10000.0, step=500.0)
-        risk_percent = st.number_input("Risk % Per Trade", min_value=0.1, value=1.0, step=0.1)
-        top_n = st.selectbox("Top rows", [10, 20, 30, 50, 100, 200], index=2)
-        selected_benchmark = st.selectbox(
-            "Benchmark",
-            ["Auto"] + BENCHMARKS,
-            index=(["Auto"] + BENCHMARKS).index(st.session_state.selected_benchmark)
-            if st.session_state.selected_benchmark in (["Auto"] + BENCHMARKS)
-            else 0,
-        )
-
-        only_a_plus = st.toggle(f"Only show A+ setups ({A_PLUS_SCORE}+)", value=False)
-        only_breakout = st.toggle("Only show breakout-ready", value=False)
-        only_market_ok = st.toggle("Only show market-healthy names", value=False)
-        min_score_filter = st.slider("Minimum score", min_value=0, max_value=100, value=0, step=1)
-
-        st.session_state.selected_benchmark = selected_benchmark
-        st.session_state.min_score_filter = min_score_filter
-
-        st.divider()
-        st.markdown(badge_html("Pro Workspace", "purple"), unsafe_allow_html=True)
-        st.markdown(INFO_TEXT)
-
-    return account_size, risk_percent, top_n, only_a_plus, only_breakout, only_market_ok, selected_benchmark, min_score_filter
-
-
-
-
-
-def render_clean_header():
-    st.markdown(
-        f"""
-        <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:18px;flex-wrap:wrap;margin-top:8px;margin-bottom:18px;">
-            <div>
-                <div style="font-size:2.45rem;font-weight:900;line-height:1.05;color:#f8fafc;">{APP_TITLE}</div>
-                <div style="font-size:1.05rem;color:#9fb4d9;margin-top:10px;">{APP_TAGLINE}</div>
-            </div>
-            <div style="display:flex;gap:10px;align-items:center;">
-                <span class="sspx-chip">👤 Profile</span>
-                <span class="sspx-chip">⚙️ Settings</span>
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-
-def run_scan_with_premium_feedback(account_size: float, risk_percent: float, selected_benchmark: str):
+def run_scan_with_premium_feedback(selected_benchmark: str = "Auto"):
     symbols = UniverseLoader.get_sp500_symbols()
     status_box = st.empty()
     progress_box = st.empty()
@@ -1951,6 +2359,7 @@ def run_scan_with_premium_feedback(account_size: float, risk_percent: float, sel
         ("Ranking strongest candidates", 82),
         ("Packaging top ideas", 100),
     ]
+    scan_meta = get_scan_market_context()
     progress = progress_box.progress(0, text="Preparing scan...")
     for message, pct in stage_steps[:2]:
         status_box.markdown(
@@ -1958,7 +2367,7 @@ def run_scan_with_premium_feedback(account_size: float, risk_percent: float, sel
             <div class="sspx-panel" style="margin-top:12px;padding:14px 16px;">
                 <div style="font-size:0.88rem;color:#93c5fd;font-weight:700;letter-spacing:0.03em;text-transform:uppercase;">Scanning engine</div>
                 <div style="font-size:1.12rem;color:#f8fafc;font-weight:800;margin-top:4px;">{message}</div>
-                <div style="font-size:0.92rem;color:#9ca3af;margin-top:6px;">Reviewing {len(symbols)} names with your current rules.</div>
+                <div style="font-size:0.92rem;color:#9ca3af;margin-top:6px;">{get_scan_status_subtitle(scan_meta)} · Reviewing {len(symbols)} names with your current rules.</div>
             </div>
             """,
             unsafe_allow_html=True,
@@ -1968,8 +2377,6 @@ def run_scan_with_premium_feedback(account_size: float, risk_percent: float, sel
     with st.spinner(f"Scanning {len(symbols)} S&P 500 stocks..."):
         results_df, price_data, logs, alerts = run_scan_logic(
             symbols,
-            account_size,
-            risk_percent,
             selected_benchmark=selected_benchmark,
         )
 
@@ -1979,7 +2386,7 @@ def run_scan_with_premium_feedback(account_size: float, risk_percent: float, sel
             <div class="sspx-panel" style="margin-top:12px;padding:14px 16px;">
                 <div style="font-size:0.88rem;color:#93c5fd;font-weight:700;letter-spacing:0.03em;text-transform:uppercase;">Scanning engine</div>
                 <div style="font-size:1.12rem;color:#f8fafc;font-weight:800;margin-top:4px;">{message}</div>
-                <div style="font-size:0.92rem;color:#9ca3af;margin-top:6px;">Finalizing today's ranked opportunity feed.</div>
+                <div style="font-size:0.92rem;color:#9ca3af;margin-top:6px;">{get_scan_status_subtitle(scan_meta)} · Finalizing today's ranked opportunity feed.</div>
             </div>
             """,
             unsafe_allow_html=True,
@@ -1991,7 +2398,7 @@ def run_scan_with_premium_feedback(account_size: float, risk_percent: float, sel
         <div class="sspx-panel" style="margin-top:12px;padding:14px 16px;border:1px solid rgba(134,239,172,0.25);">
             <div style="font-size:0.88rem;color:#86efac;font-weight:700;letter-spacing:0.03em;text-transform:uppercase;">Scan complete</div>
             <div style="font-size:1.12rem;color:#f8fafc;font-weight:800;margin-top:4px;">{len(results_df)} ranked setups ready</div>
-            <div style="font-size:0.92rem;color:#9ca3af;margin-top:6px;">Opening your top pick and ranked feed now.</div>
+            <div style="font-size:0.92rem;color:#9ca3af;margin-top:6px;">{get_scan_status_subtitle(scan_meta)} · Opening your featured pick and ranked feed now.</div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -2000,42 +2407,49 @@ def run_scan_with_premium_feedback(account_size: float, risk_percent: float, sel
     return results_df, price_data, logs, alerts
 
 
-def scanner_tab(account_size, risk_percent, top_n, only_a_plus, only_breakout, only_market_ok, selected_benchmark, min_score_filter):
+def scanner_tab():
+    top_n = 30
+    only_a_plus = False
+    only_breakout = False
+    only_market_ok = False
+    min_score_filter = 0
+
     results_df = ensure_results_schema(st.session_state.results_df.copy())
     has_results = not results_df.empty
 
     if not has_results:
-        _, mid, _ = st.columns([1.2, 2.4, 1.2])
+        st.markdown(
+            """
+            <style>
+            div[data-testid="stButton"] > button[kind="primary"] {
+                min-height: 72px;
+                font-size: 1.18rem;
+                font-weight: 800;
+                border-radius: 16px;
+            }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        _, mid, _ = st.columns([1.0, 3.2, 1.0])
         with mid:
             if st.button("Scan Now", type="primary", use_container_width=True):
                 results_df, price_data, logs, alerts = run_scan_with_premium_feedback(
-                    account_size=account_size,
-                    risk_percent=risk_percent,
-                    selected_benchmark=selected_benchmark,
+                    selected_benchmark=st.session_state.selected_benchmark,
                 )
                 st.session_state.results_df = results_df
                 st.session_state.price_data = price_data
                 st.session_state.logs = logs
                 st.session_state.alerts = alerts
+                st.session_state["has_scanned"] = True
                 if not results_df.empty:
                     st.session_state.selected_symbol = results_df.iloc[0]["symbol"]
                 st.rerun()
 
-        c1, c2 = st.columns([1.05, 1.35])
-        with c1:
+        _, mid_info, _ = st.columns([1.0, 2.0, 1.0])
+        with mid_info:
             render_scoring_explainer()
-        with c2:
-            st.markdown(
-                f"""
-                <div class="sspx-panel" style="min-height:124px;">
-                    <div style="font-size:1rem;color:#f8fafc;font-weight:800;margin-bottom:8px;">How this version works</div>
-                    <div style="font-size:0.95rem;color:#d1d5db;line-height:1.75;">
-                        Tap <span style="color:#93c5fd;font-weight:700;">Scan Now</span> to launch the ranking engine. We’ll surface your top setup first, then open the full ranked feed.
-                    </div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
 
         st.stop()
 
@@ -2049,9 +2463,6 @@ def scanner_tab(account_size, risk_percent, top_n, only_a_plus, only_breakout, o
         results_df = results_df[results_df["score"] >= min_score_filter]
 
     sectors = ["All"] + sorted([s for s in results_df["sector"].dropna().unique().tolist() if str(s).strip()])
-    sector_filter = st.selectbox("Sector filter", sectors)
-    if sector_filter != "All":
-        results_df = results_df[results_df["sector"] == sector_filter]
 
     results_df = results_df.head(max(10, top_n)).reset_index(drop=True)
 
@@ -2061,8 +2472,18 @@ def scanner_tab(account_size, risk_percent, top_n, only_a_plus, only_breakout, o
         st.info("No scan results match your current filters.")
     else:
         render_scan_kpis(results_df)
-        render_top_pick_hero(results_df, st.session_state.price_data)
-        render_ranked_feed(results_df, st.session_state.price_data, top_n=min(10, len(results_df)))
+        render_market_context(results_df)
+        st.markdown("<div style='margin-top:20px'></div>", unsafe_allow_html=True)
+        hero_symbol = render_top_pick_hero(results_df, st.session_state.price_data)
+
+        left_col, right_col = st.columns([1.5, 0.9])
+        with left_col:
+            render_ranked_feed(
+                results_df,
+                st.session_state.price_data,
+                top_n=min(10, len(results_df)),
+                exclude_symbol=hero_symbol,
+            )
 
         st.markdown("#### Feed Stats")
         c1, c2, c3, c4 = st.columns(4)
@@ -2078,8 +2499,6 @@ def scanner_tab(account_size, risk_percent, top_n, only_a_plus, only_breakout, o
         with st.expander("Advanced Table View"):
             st.markdown("For desktop review only.")
             render_results_table(results_df)
-
-        render_premium_modules()
 
     with st.expander("Scanner Log"):
         if st.session_state.logs:
@@ -2115,8 +2534,6 @@ def ideas_tab():
                 with st.spinner(f"Scanning {len(watchlist)} saved ideas..."):
                     results_df, price_data, logs, alerts = run_scan_logic(
                         watchlist,
-                        account_size=10000.0,
-                        risk_percent=1.0,
                         selected_benchmark=st.session_state.selected_benchmark,
                     )
                     st.session_state.results_df = results_df
@@ -2184,56 +2601,41 @@ def signals_tab():
     st.markdown(panel_close(), unsafe_allow_html=True)
 
 
+
+
+def watchlist_page():
+    st.markdown("## Watchlist")
+    render_saved_watchlist_bar()
+    render_watchlist_manager()
+
+
 def main():
     st.set_page_config(page_title=APP_TITLE, layout="wide", initial_sidebar_state="collapsed")
     os.makedirs(SNAPSHOT_DIR, exist_ok=True)
     ensure_state()
     inject_dark_theme()
     render_clean_header()
-
-    (
-        account_size,
-        risk_percent,
-        top_n,
-        only_a_plus,
-        only_breakout,
-        only_market_ok,
-        selected_benchmark,
-        min_score_filter,
-    ) = sidebar_controls()
+    st.session_state.setdefault("selected_benchmark", "Auto")
+    st.session_state.setdefault("has_scanned", False)
 
     has_results = not st.session_state.results_df.empty
+    if has_results:
+        st.session_state["has_scanned"] = True
 
-    if not has_results:
-        scanner_tab(
-            account_size,
-            risk_percent,
-            top_n,
-            only_a_plus,
-            only_breakout,
-            only_market_ok,
-            selected_benchmark,
-            min_score_filter,
+    if st.session_state.get("has_scanned", False):
+        page = st.radio(
+            "",
+            ["Scanner", "Watchlist"],
+            horizontal=True,
+            key="main_nav",
         )
     else:
-        tab1, tab2, tab3, tab4 = st.tabs(["Scanner", "Ideas", "Journal", "Signals"])
-        with tab1:
-            scanner_tab(
-                account_size,
-                risk_percent,
-                top_n,
-                only_a_plus,
-                only_breakout,
-                only_market_ok,
-                selected_benchmark,
-                min_score_filter,
-            )
-        with tab2:
-            ideas_tab()
-        with tab3:
-            journal_tab()
-        with tab4:
-            signals_tab()
+        page = "Scanner"
+
+    if page == "Scanner":
+        scanner_tab()
+    else:
+        watchlist_page()
 
 
 if __name__ == "__main__":
